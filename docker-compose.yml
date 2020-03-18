@@ -9,7 +9,7 @@ services:
       retries: 500
       test: curl localhost:9200
   kosh:
-    image: cceh/kosh:latest
+    image: cceh/kosh:feat-elem_id
     command: ['--data_host', 'elastic']
     ports: ['5000:5000']
     networks: ['network']
