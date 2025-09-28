@@ -1,0 +1,14 @@
+[package]
+name = "kosh-cli"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Command line entry point for the Rust-based Kosh service"
+
+[dependencies]
+clap = { workspace = true }
+kosh-api = { path = "../kosh-api" }
+kosh-core = { path = "../kosh-core" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

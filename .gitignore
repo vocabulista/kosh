@@ -1,5 +1,7 @@
-**/__pycache__
-
-/.idea
-/build
-/kosh.egg-info
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+.venv/
+.env
+rust/target/

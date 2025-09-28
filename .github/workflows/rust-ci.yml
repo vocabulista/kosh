@@ -1,0 +1,33 @@
+name: Rust CI
+
+on:
+  push:
+    branches:
+      - kosh-rust
+  pull_request:
+    branches:
+      - kosh-rust
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format
+        run: cargo fmt --all -- --check
+        working-directory: rust
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: rust
+
+      - name: Tests
+        run: cargo test --all-targets
+        working-directory: rust

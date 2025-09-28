@@ -1,0 +1,16 @@
+[package]
+name = "kosh-api"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "HTTP and GraphQL services for Kosh"
+
+[dependencies]
+axum = { workspace = true }
+kosh-core = { path = "../kosh-core" }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+async-graphql = { workspace = true }
+async-graphql-axum = { workspace = true }
