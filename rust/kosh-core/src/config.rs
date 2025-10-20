@@ -37,6 +37,7 @@ pub struct DataConfig {
     pub spec: String,
     pub sync: u32,
     pub wait: u32,
+    pub retry_backoff_secs: u32,
 }
 
 impl Default for DataConfig {
@@ -49,6 +50,7 @@ impl Default for DataConfig {
             spec: format!(".{DEFAULT_CONFIG_NAME}"),
             sync: 10,
             wait: 60,
+            retry_backoff_secs: 5,
         }
     }
 }
@@ -186,6 +188,20 @@ impl KoshConfig {
         Ok(config)
     }
 
+    /// Merge overrides defined in an INI string.
+    pub fn merge_inline(&mut self, raw: &str) -> Result<(), ConfigError> {
+        let mut parser = Ini::new();
+        let map = parser
+            .read(raw.to_string())
+            .map_err(|details| ConfigError::ParseInline { details })?;
+        self.apply_ini(&map)
+    }
+
+    /// Resynchronise values that inherit from the configured service name.
+    pub fn refresh_name_dependents(&mut self) {
+        self.sync_name_dependents();
+    }
+
     /// Merge overrides from an INI document onto the current configuration.
     fn apply_ini(
         &mut self,
@@ -225,6 +241,11 @@ impl KoshConfig {
         }
         if let Some(wait) = ini_value(map, "data", "wait") {
             self.data.wait = parse_u32("data.wait", wait)?;
+        }
+        if let Some(backoff) = ini_value(map, "data", "retry_backoff_secs")
+            .or_else(|| ini_value(map, "data", "retry_backoff"))
+        {
+            self.data.retry_backoff_secs = parse_u32("data.retry_backoff_secs", backoff)?;
         }
 
         if let Some(desc) = ini_value(map, "info", "desc") {
@@ -309,6 +330,22 @@ impl KoshConfig {
     pub fn namespace(&self, prefix: &str) -> Option<&str> {
         self.namespaces.0.get(prefix).map(|value| value.as_str())
     }
+
+    /// Return the list of enabled query types respecting configuration flags.
+    pub fn enabled_query_types(&self) -> Vec<String> {
+        [
+            ("term", self.query_types.term),
+            ("fuzzy", self.query_types.fuzzy),
+            ("match", self.query_types.r#match),
+            ("match_phrase", self.query_types.match_phrase),
+            ("prefix", self.query_types.prefix),
+            ("wildcard", self.query_types.wildcard),
+            ("regexp", self.query_types.regexp),
+        ]
+        .into_iter()
+        .filter_map(|(name, enabled)| enabled.then(|| name.to_string()))
+        .collect()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -321,6 +358,8 @@ pub enum ConfigError {
     },
     #[error("failed to parse INI at {path:?}: {details}")]
     ParseConfig { path: PathBuf, details: String },
+    #[error("failed to parse inline INI: {details}")]
+    ParseInline { details: String },
     #[error("invalid integer for {key}: {value}")]
     InvalidInt {
         key: String,
@@ -398,6 +437,7 @@ mod tests {
         assert_eq!(config.name, "kosh");
         assert_eq!(config.api.port, 5000);
         assert_eq!(config.data.root, PathBuf::from("/var/lib/kosh"));
+        assert_eq!(config.data.retry_backoff_secs, 5);
     }
 
     #[test]
@@ -415,6 +455,7 @@ mod tests {
         assert_eq!(config.api.port, 8088);
         assert_eq!(config.data.root, PathBuf::from("/srv/kosh"));
         assert_eq!(config.data.pool, "custom");
+        assert_eq!(config.data.retry_backoff_secs, 5);
     }
 
     #[test]
@@ -428,5 +469,43 @@ mod tests {
         assert_eq!(config.data.pool, "alt");
         assert_eq!(config.data.root, PathBuf::from("/var/lib/alt"));
         assert_eq!(config.data.spec, ".alt");
+    }
+
+    #[test]
+    fn retry_backoff_overrides_are_applied() {
+        let mut file = NamedTempFile::new().expect("temp file");
+        writeln!(file, "[data]\nretry_backoff = 4\n").expect("write config");
+
+        let config = KoshConfig::from_optional_file(Some(file.path())).expect("load config");
+
+        assert_eq!(config.data.retry_backoff_secs, 4);
+    }
+
+    #[test]
+    fn enabled_query_types_collects_flags() {
+        let config = KoshConfig::default();
+        assert_eq!(
+            config.enabled_query_types(),
+            vec!["term", "fuzzy", "match", "match_phrase"]
+        );
+
+        let mut config = config;
+        config.query_types.prefix = true;
+        config.query_types.regexp = true;
+
+        assert_eq!(
+            config.enabled_query_types(),
+            vec!["term", "fuzzy", "match", "match_phrase", "prefix", "regexp"]
+        );
+    }
+
+    #[test]
+    fn inline_merge_updates_config() {
+        let mut config = KoshConfig::default();
+        config
+            .merge_inline("[logger]\nlevel = debug\n")
+            .expect("inline merge");
+
+        assert_eq!(config.logger.level, "debug");
     }
 }

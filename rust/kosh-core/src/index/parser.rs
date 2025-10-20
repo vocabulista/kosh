@@ -433,16 +433,20 @@ mod tests {
         assert!(xml_0.contains("<lemma>Foo</lemma>"));
         assert!(docs[0].fields.contains_key("created"));
 
-        assert_ne!(docs[1].id, "a");
-        assert_eq!(
-            docs[1].fields.get("lemma"),
-            Some(&JsonValue::String("Bar".into()))
-        );
         let xml_1 = docs[1]
             .fields
             .get("xml")
             .and_then(|v| v.as_str())
             .expect("xml field");
+        let mut hasher = Sha1::new();
+        hasher.update(xml_1.as_bytes());
+        let expected_hash = format!("{:x}", hasher.finalize());
+
+        assert_eq!(docs[1].id, expected_hash);
+        assert_eq!(
+            docs[1].fields.get("lemma"),
+            Some(&JsonValue::String("Bar".into()))
+        );
         assert!(xml_1.contains("<lemma>Bar</lemma>"));
         assert!(docs[1].fields.contains_key("created"));
     }

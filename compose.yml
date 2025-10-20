@@ -2,12 +2,10 @@ version: '3'
 
 services:
   elasticsearch:
-    image: elasticsearch:7.17.19
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.1.1
     environment:
-      - ES_SETTING_DISCOVERY_TYPE=single-node
-      - ES_SETTING_LOGGER_DEPRECATION_LEVEL=off
-      - ES_SETTING_LOGGER_LEVEL=warn
-      - ES_SETTING_XPACK_SECURITY_ENABLED=false
+      discovery.type: single-node
+      xpack.security.enabled: "false"
     healthcheck:
       test: curl 127.0.0.1:9200 &>/dev/null
 
