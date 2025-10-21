@@ -1,0 +1,21 @@
+<items>
+  <item>
+    <id>alt-1</id>
+    <lemma>Gamma</lemma>
+    <pos>noun</pos>
+    <sense>third</sense>
+    <sense>tertiary</sense>
+  </item>
+  <item>
+    <id>alt-2</id>
+    <lemma>Delta</lemma>
+    <pos>noun</pos>
+    <sense>fourth</sense>
+  </item>
+  <item>
+    <id>alt-3</id>
+    <lemma>Epsilon</lemma>
+    <pos>noun</pos>
+    <sense>fifth</sense>
+  </item>
+</items>

@@ -13,5 +13,10 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 async-graphql = { workspace = true }
-async-graphql-axum = { workspace = true }
 serde_json = { workspace = true }
+once_cell = "1"
+prometheus = "0.13"
+
+[dev-dependencies]
+httpmock = "0.7"
+tempfile = "3"

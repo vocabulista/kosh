@@ -1,0 +1,15 @@
+<items>
+  <item>
+    <id>demo-1</id>
+    <lemma>Alpha</lemma>
+    <pos>noun</pos>
+    <sense>first</sense>
+    <sense>primary</sense>
+  </item>
+  <item>
+    <id>demo-2</id>
+    <lemma>Beta</lemma>
+    <pos>noun</pos>
+    <sense>second</sense>
+  </item>
+</items>

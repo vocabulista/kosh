@@ -1,0 +1,11 @@
+[demo]
+files = entries.xml
+schema = schema.json
+language = en
+title = Demo Lexicon
+
+[demo_alt]
+files = entries_alt.xml
+schema = schema_alt.json
+language = en
+title = Alternate Demo Lexicon

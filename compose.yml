@@ -18,3 +18,15 @@ services:
       elasticsearch: {condition: service_healthy}
     healthcheck:
       test: wget --spider 127.0.0.1:5000 &>/dev/null
+
+  kosh-rust:
+    build:
+      context: .
+      dockerfile: Dockerfile.rust
+    command: --data-host http://elasticsearch:9200
+    ports: [5001:5000]
+    volumes: [../kosh_data:/var/lib/kosh:ro]
+    depends_on:
+      elasticsearch: {condition: service_healthy}
+    healthcheck:
+      test: wget -qO- 127.0.0.1:5000/metrics | grep kosh_http_requests_total &>/dev/null

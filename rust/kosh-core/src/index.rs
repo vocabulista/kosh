@@ -134,6 +134,10 @@ where
 
         self.backend.bulk_index(lexicon, documents).await
     }
+
+    pub async fn delete(&self, lexicon: &LexiconDescriptor) -> Result<(), IndexError> {
+        self.backend.delete_index(lexicon).await
+    }
 }
 
 #[cfg(test)]

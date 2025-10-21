@@ -5,6 +5,8 @@ __pycache__/
 .venv/
 .env
 rust/target/
+artifacts/
+parity/
 *.md
 !README.md
 !**/README.md
