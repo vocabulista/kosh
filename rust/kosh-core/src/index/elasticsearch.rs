@@ -1,3 +1,5 @@
+//! Elasticsearch-backed implementation of the indexing abstractions.
+
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -39,6 +41,7 @@ impl Default for ElasticsearchConfig {
     }
 }
 
+/// Thin wrapper over the Elasticsearch HTTP API tailored for lexicon indices.
 #[derive(Debug, Clone)]
 pub struct ElasticsearchBackend {
     config: ElasticsearchConfig,
@@ -47,6 +50,7 @@ pub struct ElasticsearchBackend {
 }
 
 impl ElasticsearchBackend {
+    /// Create a backend from the supplied configuration, preparing the HTTP client.
     pub fn new(config: ElasticsearchConfig) -> Result<Self, ElasticsearchBackendError> {
         let timeout = StdDuration::from_secs(config.request_timeout_secs.max(1));
         let mut builder = Client::builder().timeout(timeout);
@@ -71,11 +75,13 @@ impl ElasticsearchBackend {
         })
     }
 
+    /// Convert the backend into an [`IndexService`] ready for use by higher layers.
     pub fn into_service(self) -> IndexService<Self> {
         info!(endpoint = %self.base, "initialised Elasticsearch backend");
         IndexService::new(Arc::new(self))
     }
 
+    /// Perform a lightweight health check against the configured endpoint.
     pub async fn ping(&self) -> Result<(), IndexError> {
         let response = self
             .execute_with_retry("ping", || self.request(Method::GET, ""))
@@ -286,6 +292,7 @@ impl IndexBackend for ElasticsearchBackend {
     }
 }
 
+/// Errors raised while initialising or interacting with the Elasticsearch backend.
 #[derive(Debug, Error)]
 pub enum ElasticsearchBackendError {
     #[error("unsupported authentication mode")]

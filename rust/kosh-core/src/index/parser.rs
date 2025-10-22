@@ -1,3 +1,5 @@
+//! Helpers for parsing XML lexicon entries into Elasticsearch documents.
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -21,6 +23,7 @@ use tracing::info;
 use super::{IndexDocument, IndexError};
 use crate::lexicon::LexiconDescriptor;
 
+/// XPath metadata embedded in the Elasticsearch schema of a lexicon.
 #[derive(Debug, Clone)]
 pub struct LexiconXpaths {
     pub root: String,
@@ -29,6 +32,7 @@ pub struct LexiconXpaths {
 }
 
 impl LexiconXpaths {
+    /// Extract the required XPath expressions from the `_meta._xpaths` section of a schema.
     pub fn from_schema(schema: &JsonValue) -> Result<Self, ParserError> {
         let mappings = schema
             .get("mappings")
@@ -74,6 +78,7 @@ impl LexiconXpaths {
     }
 }
 
+/// Errors emitted while parsing lexicon entries into index documents.
 #[derive(Debug, Error)]
 pub enum ParserError {
     #[error("schema missing node: {0}")]
@@ -108,6 +113,7 @@ pub enum ParserError {
     Index(#[from] IndexError),
 }
 
+/// Parses XML entries referenced by a [`LexiconDescriptor`] into [`IndexDocument`]s.
 pub struct XmlEntryParser {
     lexicon: Arc<LexiconDescriptor>,
     namespaces: HashMap<String, String>,
@@ -115,6 +121,7 @@ pub struct XmlEntryParser {
 }
 
 impl XmlEntryParser {
+    /// Build a parser for the supplied lexicon, loading XPath definitions from its schema.
     pub fn new(
         lexicon: Arc<LexiconDescriptor>,
         namespaces: HashMap<String, String>,
@@ -127,18 +134,25 @@ impl XmlEntryParser {
         })
     }
 
+    /// Return the descriptor associated with this parser.
     pub fn lexicon(&self) -> Arc<LexiconDescriptor> {
         Arc::clone(&self.lexicon)
     }
 
+    /// Borrow the namespace mappings applied when evaluating XPath expressions.
     pub fn namespaces(&self) -> &HashMap<String, String> {
         &self.namespaces
     }
 
+    /// Expose the resolved XPath configuration used for parsing.
     pub fn xpaths(&self) -> &LexiconXpaths {
         &self.xpaths
     }
 
+    /// Parse an XML file, producing a document for every entry matched by the root XPath.
+    ///
+    /// Each generated document includes the raw XML snapshot and a `created`
+    /// timestamp to support downstream pipelines.
     pub fn parse_file(&self, path: &Path) -> Result<Vec<IndexDocument>, ParserError> {
         let xml = fs::read_to_string(path).map_err(|source| ParserError::Io {
             path: path.to_path_buf(),

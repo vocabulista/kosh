@@ -1,3 +1,5 @@
+//! Query helpers bridging lexicon descriptors and Elasticsearch search APIs.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -15,10 +17,16 @@ pub struct SearchService {
 }
 
 impl SearchService {
+    /// Instantiate the service with a shared Elasticsearch backend.
     pub fn new(backend: Arc<ElasticsearchBackend>) -> Self {
         Self { backend }
     }
 
+    /// Fetch specific entries by identifier via a `_mget` request.
+    ///
+    /// Duplicate identifiers are coalesced client-side to avoid unnecessary
+    /// network overhead. The returned maps include the original `_id` under
+    /// the `id` key to match REST payloads.
     pub async fn fetch_ids(
         &self,
         lexicon: &LexiconDescriptor,
@@ -94,6 +102,7 @@ impl SearchService {
         Ok(results)
     }
 
+    /// Execute a fielded search against the lexicon index, returning source documents.
     pub async fn search_entries(
         &self,
         lexicon: &LexiconDescriptor,
@@ -164,11 +173,13 @@ impl SearchService {
         Ok(results)
     }
 
+    /// Access the underlying Elasticsearch backend for advanced use cases.
     pub fn backend(&self) -> &Arc<ElasticsearchBackend> {
         &self.backend
     }
 }
 
+/// Errors produced during search operations.
 #[derive(Debug, Error)]
 pub enum SearchError {
     #[error("backend error: {details}")]

@@ -1,3 +1,5 @@
+//! Index abstractions bridging lexicon descriptors and Elasticsearch backends.
+
 pub mod elasticsearch;
 pub mod parser;
 
@@ -18,6 +20,10 @@ pub struct IndexDocument {
 }
 
 impl IndexDocument {
+    /// Create an `IndexDocument` while validating the identifier.
+    ///
+    /// Returns [`IndexError::InvalidDocument`] if the supplied identifier is
+    /// empty or consists solely of whitespace.
     pub fn new(id: impl Into<String>, fields: Map<String, JsonValue>) -> Result<Self, IndexError> {
         let id = id.into();
 
@@ -38,11 +44,13 @@ pub struct IndexStats {
 }
 
 impl IndexStats {
+    /// Instantiate stats capturing the number of indexed documents.
     pub fn new(indexed: usize) -> Self {
         Self { indexed }
     }
 }
 
+/// Errors raised while coordinating indexing operations.
 #[derive(Debug, Error)]
 pub enum IndexError {
     #[error("backend error: {details}")]
@@ -61,17 +69,21 @@ impl IndexError {
     }
 }
 
+/// Abstraction for pluggable backends that can manage lexicon indices.
 #[async_trait]
 pub trait IndexBackend: Send + Sync {
+    /// Create a fresh index for the given lexicon using the supplied schema.
     async fn create_index(
         &self,
         lexicon: &LexiconDescriptor,
         schema: &JsonValue,
     ) -> Result<(), IndexError>;
 
+    /// Remove the existing index for the given lexicon, if it exists.
     async fn delete_index(&self, lexicon: &LexiconDescriptor) -> Result<(), IndexError>;
 
     // TODO: Support streaming document sources to avoid holding large batches in memory.
+    /// Bulk index a batch of documents for the lexicon, returning aggregated stats.
     async fn bulk_index(
         &self,
         lexicon: &LexiconDescriptor,
@@ -79,6 +91,7 @@ pub trait IndexBackend: Send + Sync {
     ) -> Result<IndexStats, IndexError>;
 }
 
+/// High-level façade over an [`IndexBackend`] with lexicon-aware helpers.
 pub struct IndexService<B>
 where
     B: IndexBackend + ?Sized,
@@ -101,10 +114,15 @@ impl<B> IndexService<B>
 where
     B: IndexBackend + ?Sized,
 {
+    /// Construct a new service that forwards work to the provided backend.
     pub fn new(backend: Arc<B>) -> Self {
         Self { backend }
     }
 
+    /// Rebuild an index by deleting, recreating, and bulk indexing all documents.
+    ///
+    /// Returns [`IndexError::NoDocuments`] when called with an empty batch to
+    /// avoid accidentally dropping live indices.
     pub async fn rebuild(
         &self,
         lexicon: &LexiconDescriptor,
@@ -121,6 +139,9 @@ where
         self.backend.bulk_index(lexicon, documents).await
     }
 
+    /// Append a batch of documents to an existing index without recreating it.
+    ///
+    /// Returns [`IndexError::NoDocuments`] when invoked with an empty batch.
     pub async fn append(
         &self,
         lexicon: &LexiconDescriptor,
@@ -135,6 +156,7 @@ where
         self.backend.bulk_index(lexicon, documents).await
     }
 
+    /// Delete the index for the provided lexicon.
     pub async fn delete(&self, lexicon: &LexiconDescriptor) -> Result<(), IndexError> {
         self.backend.delete_index(lexicon).await
     }

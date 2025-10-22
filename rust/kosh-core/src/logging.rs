@@ -1,3 +1,5 @@
+//! Logging initialisation helpers built around the `tracing` ecosystem.
+
 use std::error::Error as StdError;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -8,6 +10,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 
 use crate::{LogFormat, LoggerConfig};
 
+/// Failures that can occur while installing logging/tracing primitives.
 #[derive(Debug, Error)]
 pub enum LoggingError {
     #[error("invalid log level {level}")]
@@ -26,6 +29,7 @@ pub enum LoggingError {
     },
 }
 
+/// Install a `tracing` subscriber matching the supplied [`LoggerConfig`].
 pub fn init_tracing(config: &LoggerConfig) -> Result<(), LoggingError> {
     match config.format {
         LogFormat::Json => init_json_tracing(config),
@@ -114,6 +118,7 @@ fn init_text_tracing(config: &LoggerConfig) -> Result<(), LoggingError> {
     Ok(())
 }
 
+/// Create (and append to) the configured log file, ensuring parent directories exist.
 fn open_log_file(path: &Path) -> Result<Mutex<File>, LoggingError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| LoggingError::Io {
