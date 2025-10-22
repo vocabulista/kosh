@@ -787,6 +787,7 @@ async fn run() -> Result<(), CliError> {
             namespaces,
             service,
             budget,
+            Arc::clone(&shared_state),
             metrics_clone,
             "bootstrap",
             false,
@@ -971,6 +972,7 @@ async fn apply_incremental_updates(
             Arc::clone(&namespaces),
             index_service.clone(),
             Arc::clone(&budget),
+            Arc::clone(&state),
             Arc::clone(&metrics),
             "watcher",
             true,
@@ -982,7 +984,7 @@ async fn apply_incremental_updates(
 }
 
 enum RebuildOutcome {
-    Indexed,
+    Indexed { indexed: usize },
     SkippedNoDocuments,
 }
 
@@ -1049,7 +1051,9 @@ async fn rebuild_lexicon(
                 indexed = stats.indexed,
                 "completed rebuild"
             );
-            Ok(RebuildOutcome::Indexed)
+            Ok(RebuildOutcome::Indexed {
+                indexed: stats.indexed,
+            })
         }
     }
 }
@@ -1059,6 +1063,7 @@ async fn execute_rebuild(
     namespaces: Arc<HashMap<String, String>>,
     service: IndexService<ElasticsearchBackend>,
     budget: Arc<RwLock<FailureBudget>>,
+    state: Arc<AppState>,
     metrics: Arc<Metrics>,
     phase: &'static str,
     respect_quarantine: bool,
@@ -1087,10 +1092,11 @@ async fn execute_rebuild(
     .await;
 
     match result {
-        Ok(RebuildOutcome::Indexed) => {
+        Ok(RebuildOutcome::Indexed { indexed }) => {
             metrics.record_rebuild(phase, &uid, RebuildOutcomeMetric::Success);
             let mut guard = budget.write().await;
             guard.record_success(&uid);
+            state.update_lexicon_size(&uid, indexed).await;
         }
         Ok(RebuildOutcome::SkippedNoDocuments) => {
             metrics.record_rebuild(phase, &uid, RebuildOutcomeMetric::SkippedEmpty);
@@ -1165,6 +1171,7 @@ async fn rescan_lexica(
             Arc::clone(&namespaces),
             index_service.clone(),
             Arc::clone(&budget),
+            Arc::clone(&state),
             Arc::clone(&metrics),
             "watcher",
             true,
@@ -1172,7 +1179,6 @@ async fn rescan_lexica(
         .await;
     }
 
-    state.replace_lexica(shared).await;
     Ok(())
 }
 

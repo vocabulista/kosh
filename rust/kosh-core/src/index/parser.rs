@@ -343,7 +343,9 @@ fn clone_element<'d>(
                 new_element.append_child(cloned);
             }
             ChildOfElement::Text(text) => {
-                new_element.append_child(dest_document.create_text(text.text()));
+                if !text.text().trim().is_empty() {
+                    new_element.append_child(dest_document.create_text(text.text()));
+                }
             }
             ChildOfElement::Comment(comment) => {
                 new_element.append_child(dest_document.create_comment(comment.text()));

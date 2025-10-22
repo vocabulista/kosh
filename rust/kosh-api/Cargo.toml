@@ -14,6 +14,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 async-graphql = { workspace = true }
 serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
 once_cell = "1"
 prometheus = "0.13"
 

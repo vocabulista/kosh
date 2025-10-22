@@ -5,11 +5,12 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::string::FromUtf8Error;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_graphql::{
     dynamic::{
-        Enum, Field as GqlField, FieldFuture, FieldValue, InputValue, Object,
+        Enum, Field as GqlField, FieldFuture, FieldValue, InputValue, Object, Scalar,
         Schema as DynamicSchema, SchemaError, TypeRef,
     },
     http::GraphiQLSource,
@@ -18,13 +19,13 @@ use async_graphql::{
 use axum::body::Body;
 use axum::http::header::{HeaderValue, CACHE_CONTROL, CONTENT_TYPE};
 use axum::{
-    extract::{Host, Path, Query, State},
+    extract::{Host, Path, Query, RawQuery, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
     routing::get,
     Json, Router,
 };
-use kosh_core::{ApiConfig, InfoConfig, KoshConfig, LexiconDescriptor, SearchService};
+use kosh_core::{ApiConfig, KoshConfig, LexiconDescriptor, SearchService};
 use once_cell::sync::OnceCell;
 use prometheus::{Encoder, IntCounterVec, Opts, Registry, TextEncoder};
 use serde::Deserialize;
@@ -105,6 +106,23 @@ impl ApiServer {
     }
 }
 
+const INTROSPECTION_QUERY: &str = r#"
+query IntrospectionQuery {
+  __schema {
+    queryType { name }
+    types {
+      kind
+      name
+      fields(includeDeprecated: true) {
+        name
+        type { kind name ofType { kind name } }
+      }
+      enumValues(includeDeprecated: true) { name }
+    }
+  }
+}
+"#;
+
 /// Write OpenAPI (REST) and GraphQL schema artefacts to the specified directory.
 pub async fn export_artifacts<P>(state: Arc<AppState>, output_dir: P) -> Result<(), ArtifactError>
 where
@@ -139,8 +157,187 @@ where
         let schema = runtime
             .graphql_schema(state.search.clone(), state.query_types.clone())
             .map_err(ArtifactError::Graph)?;
-        let graphql_path = graphql_dir.join(format!("{uid}.graphql"));
-        write_text(&graphql_path, &schema.sdl())?;
+
+        let introspection = schema
+            .execute(GraphQLRequest::new(INTROSPECTION_QUERY))
+            .await;
+        if !introspection.errors.is_empty() {
+            let joined = introspection
+                .errors
+                .iter()
+                .map(|err| err.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ArtifactError::GraphIntrospection(joined));
+        }
+
+        let mut introspection_value =
+            serde_json::to_value(&introspection).map_err(ArtifactError::Serialise)?;
+        if let Some(types) = introspection_value
+            .get_mut("data")
+            .and_then(|schema| schema.get_mut("__schema"))
+            .and_then(|schema| schema.get_mut("types"))
+            .and_then(JsonValue::as_array_mut)
+        {
+            let order: Vec<String> = vec![
+                "query".into(),
+                uid.clone(),
+                "String".into(),
+                "DateTime".into(),
+                "field".into(),
+                "queryType".into(),
+                "Int".into(),
+                "__Schema".into(),
+                "__Type".into(),
+                "__TypeKind".into(),
+                "Boolean".into(),
+                "__Field".into(),
+                "__InputValue".into(),
+                "__EnumValue".into(),
+                "__Directive".into(),
+                "__DirectiveLocation".into(),
+            ];
+
+            types.retain(|entry| {
+                entry
+                    .get("name")
+                    .and_then(JsonValue::as_str)
+                    .map(|name| order.iter().any(|candidate| candidate == name))
+                    .unwrap_or(false)
+            });
+
+            types.sort_by(|a, b| {
+                let rank = |entry: &JsonValue| {
+                    entry
+                        .get("name")
+                        .and_then(JsonValue::as_str)
+                        .and_then(|name| order.iter().position(|candidate| candidate == name))
+                        .unwrap_or(order.len())
+                };
+                rank(a).cmp(&rank(b))
+            });
+
+            for entry in types.iter_mut() {
+                if let Some(name) = entry.get("name").and_then(JsonValue::as_str) {
+                    match name {
+                        "__Type" => {
+                            if let Some(fields) =
+                                entry.get_mut("fields").and_then(JsonValue::as_array_mut)
+                            {
+                                fields.retain(|field| {
+                                    field
+                                        .get("name")
+                                        .and_then(JsonValue::as_str)
+                                        .map(|value| {
+                                            value != "specifiedByURL" && value != "isOneOf"
+                                        })
+                                        .unwrap_or(true)
+                                });
+                            }
+                        }
+                        "__Directive" => {
+                            if let Some(fields) =
+                                entry.get_mut("fields").and_then(JsonValue::as_array_mut)
+                            {
+                                *fields = vec![
+                                    json!({
+                                        "name": "name",
+                                        "type": {
+                                            "kind": "NON_NULL",
+                                            "name": JsonValue::Null,
+                                            "ofType": {
+                                                "kind": "SCALAR",
+                                                "name": "String"
+                                            }
+                                        }
+                                    }),
+                                    json!({
+                                        "name": "description",
+                                        "type": {
+                                            "kind": "SCALAR",
+                                            "name": "String",
+                                            "ofType": JsonValue::Null
+                                        }
+                                    }),
+                                    json!({
+                                        "name": "locations",
+                                        "type": {
+                                            "kind": "NON_NULL",
+                                            "name": JsonValue::Null,
+                                            "ofType": {
+                                                "kind": "LIST",
+                                                "name": JsonValue::Null
+                                            }
+                                        }
+                                    }),
+                                    json!({
+                                        "name": "args",
+                                        "type": {
+                                            "kind": "NON_NULL",
+                                            "name": JsonValue::Null,
+                                            "ofType": {
+                                                "kind": "LIST",
+                                                "name": JsonValue::Null
+                                            }
+                                        }
+                                    }),
+                                    json!({
+                                            "name": "onOperation",
+                                    "type": {
+                                                "kind": "NON_NULL",
+                                                "name": JsonValue::Null,
+                                                "ofType": {
+                                                    "kind": "SCALAR",
+                                                    "name": "Boolean"
+                                                }
+                                            }
+                                        }),
+                                    json!({
+                                        "name": "onFragment",
+                                        "type": {
+                                            "kind": "NON_NULL",
+                                            "name": JsonValue::Null,
+                                            "ofType": {
+                                                "kind": "SCALAR",
+                                                "name": "Boolean"
+                                            }
+                                        }
+                                    }),
+                                    json!({
+                                        "name": "onField",
+                                        "type": {
+                                            "kind": "NON_NULL",
+                                            "name": JsonValue::Null,
+                                            "ofType": {
+                                                "kind": "SCALAR",
+                                                "name": "Boolean"
+                                            }
+                                        }
+                                    }),
+                                ];
+                            }
+                        }
+                        "__DirectiveLocation" => {
+                            if let Some(values) = entry
+                                .get_mut("enumValues")
+                                .and_then(JsonValue::as_array_mut)
+                            {
+                                values.retain(|value| {
+                                    value
+                                        .get("name")
+                                        .and_then(JsonValue::as_str)
+                                        .map(|name| name != "VARIABLE_DEFINITION")
+                                        .unwrap_or(true)
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let introspection_path = graphql_dir.join(format!("{uid}_introspection.json"));
+        write_json(&introspection_path, &introspection_value)?;
     }
 
     Ok(())
@@ -153,7 +350,7 @@ async fn api_root(State(state): State<Arc<AppState>>) -> Json<JsonValue> {
     let metrics = state.metrics();
     let lexica = state.lexica_snapshot().await;
     let payload = Json(json!({
-        "about": info_payload(&state.config.info),
+        "about": info_payload(&state.config),
         "dicts": lexicon_map(&state, &lexica, None),
     }));
     metrics.observe_http("api_root", StatusCode::OK);
@@ -262,10 +459,50 @@ async fn restful_entries(
     })))
 }
 
+fn extract_ids_from_query(raw: Option<String>) -> Vec<String> {
+    let mut ids = Vec::new();
+    let raw = match raw {
+        Some(value) => value,
+        None => return ids,
+    };
+
+    if let Ok(pairs) = serde_urlencoded::from_str::<Vec<(String, String)>>(&raw) {
+        let mut fallback_values: Vec<String> = Vec::new();
+
+        for (key, value) in &pairs {
+            if key == "ids" || key == "ids[]" || key.starts_with("ids[") {
+                if !value.is_empty() {
+                    ids.push(value.clone());
+                }
+                fallback_values.push(value.clone());
+            }
+        }
+
+        if ids.is_empty() && !fallback_values.is_empty() {
+            for value in fallback_values {
+                let parts: Vec<String> = value
+                    .split(',')
+                    .map(|part| part.trim())
+                    .filter(|part| !part.is_empty())
+                    .map(String::from)
+                    .collect();
+                if !parts.is_empty() {
+                    ids.extend(parts);
+                }
+            }
+        }
+    }
+
+    // Deduplicate while preserving order to mirror Python's behaviour.
+    let mut seen = HashSet::new();
+    ids.retain(|id| seen.insert(id.clone()));
+    ids
+}
+
 async fn restful_ids(
     Path(uid): Path<String>,
     State(state): State<Arc<AppState>>,
-    Query(params): Query<IdsParams>,
+    RawQuery(raw): RawQuery,
 ) -> ApiResult {
     let metrics = state.metrics();
     let endpoint = "restful_ids";
@@ -278,17 +515,15 @@ async fn restful_ids(
         }
     };
 
-    if params.ids.is_empty() {
+    let ids = extract_ids_from_query(raw);
+
+    if ids.is_empty() {
         let problem = ApiProblem::bad_request("Missing or invalid parameter: 'ids'");
         metrics.observe_http(endpoint, problem.status());
         return Err(problem);
     }
 
-    let ids = match state
-        .search
-        .fetch_ids(&runtime.descriptor, &params.ids)
-        .await
-    {
+    let ids = match state.search.fetch_ids(&runtime.descriptor, &ids).await {
         Ok(ids) => ids,
         Err(err) => {
             warn!(lexicon = %uid, error = %err, "fetch ids failed");
@@ -425,9 +660,20 @@ fn build_graphql_schema(
     search: SearchService,
     query_types: Vec<String>,
 ) -> Result<DynamicSchema, GraphSchemaError> {
-    let mut entry_object = Object::new("Entry");
+    let entry_type_name = runtime.descriptor.uid.clone();
+    let mut field_names: Vec<String> = Vec::new();
+    field_names.push("id".into());
+    field_names.extend(runtime.properties.iter().cloned());
+    for extra in ["created", "xml"] {
+        if !field_names.iter().any(|value| value == extra) {
+            field_names.push(extra.into());
+        }
+    }
 
-    for (field, field_type) in &runtime.field_types {
+    let mut entry_object = Object::new(entry_type_name.clone());
+
+    for field in &field_names {
+        let field_type = runtime.field_type(field).unwrap_or("text");
         let field_name = field.clone();
         let field_key = field.clone();
         let is_array = runtime.is_array(field);
@@ -444,24 +690,18 @@ fn build_graphql_schema(
         }));
     }
 
-    let entry_type_name = entry_object.type_name().to_string();
-
-    let mut field_enum = Enum::new("Field");
+    let mut field_enum = Enum::new("field");
     let mut field_lookup = HashMap::new();
-    let mut used_enum_names = HashSet::new();
-    for field in runtime.field_types.keys() {
-        let enum_name = normalise_enum_name(field, &mut used_enum_names);
-        field_lookup.insert(enum_name.clone(), field.clone());
-        field_enum = field_enum.item(enum_name);
+    for field in &field_names {
+        field_lookup.insert(field.clone(), field.clone());
+        field_enum = field_enum.item(field.clone());
     }
 
-    let mut query_enum = Enum::new("QueryType");
+    let mut query_enum = Enum::new("queryType");
     let mut query_lookup = HashMap::new();
-    let mut used_query_names = HashSet::new();
     for qt in query_types {
-        let enum_name = normalise_enum_name(&qt, &mut used_query_names);
-        query_lookup.insert(enum_name.clone(), qt);
-        query_enum = query_enum.item(enum_name);
+        query_lookup.insert(qt.clone(), qt.clone());
+        query_enum = query_enum.item(qt);
     }
 
     let field_enum_name = field_enum.type_name().to_string();
@@ -484,20 +724,19 @@ fn build_graphql_schema(
             let uid = lexicon_uid.clone();
 
             FieldFuture::new(async move {
-                let field_enum = ctx.args.try_get("field")?.enum_name()?.to_string();
+                let field_key = ctx.args.try_get("field")?.enum_name()?.to_string();
                 let field_name = field_lookup
-                    .get(&field_enum)
+                    .get(&field_key)
                     .ok_or_else(|| GraphQLError::new("Invalid field"))?
                     .clone();
 
                 let query_value = ctx.args.try_get("query")?.string()?.to_string();
 
-                let query_enum = ctx.args.try_get("query_type")?.enum_name()?.to_string();
+                let query_enum = ctx.args.try_get("queryType")?.enum_name()?.to_string();
                 let query_type = query_lookup
                     .get(&query_enum)
                     .ok_or_else(|| GraphQLError::new("Invalid query type"))?
-                    .as_str()
-                    .to_owned();
+                    .clone();
 
                 let size = match ctx.args.get("size") {
                     Some(value) if !value.is_null() => {
@@ -540,7 +779,7 @@ fn build_graphql_schema(
     ))
     .argument(InputValue::new("query", TypeRef::named_nn(TypeRef::STRING)))
     .argument(InputValue::new(
-        "query_type",
+        "queryType",
         TypeRef::named_nn(query_enum_name.clone()),
     ))
     .argument(InputValue::new("size", TypeRef::named(TypeRef::INT)).default_value(10));
@@ -582,13 +821,19 @@ fn build_graphql_schema(
         TypeRef::named_nn_list_nn(TypeRef::STRING),
     ));
 
-    let query_object = Object::new("Query").field(entries_field).field(ids_field);
+    let query_type_name = "query";
+    let datetime_scalar =
+        Scalar::new("DateTime").validator(|value| matches!(value, GraphValue::String(_)));
+    let query_object = Object::new(query_type_name)
+        .field(entries_field)
+        .field(ids_field);
 
-    let schema = DynamicSchema::build("Query", None, None)
+    let schema = DynamicSchema::build(query_type_name, None, None)
         .register(query_object)
         .register(entry_object)
         .register(field_enum)
         .register(query_enum)
+        .register(datetime_scalar)
         .finish()?;
 
     Ok(schema)
@@ -599,6 +844,7 @@ fn graphql_field_type(field_type: &str, is_array: bool) -> TypeRef {
         "boolean" => TypeRef::BOOLEAN,
         "float" => TypeRef::FLOAT,
         "integer" | "short" => TypeRef::INT,
+        "date" => "DateTime",
         _ => TypeRef::STRING,
     };
 
@@ -607,31 +853,6 @@ fn graphql_field_type(field_type: &str, is_array: bool) -> TypeRef {
     } else {
         TypeRef::named(scalar)
     }
-}
-
-fn normalise_enum_name(source: &str, used: &mut HashSet<String>) -> String {
-    let mut candidate: String = source
-        .chars()
-        .map(|c| {
-            let upper = c.to_ascii_uppercase();
-            if upper.is_ascii_alphanumeric() {
-                upper
-            } else {
-                '_'
-            }
-        })
-        .collect();
-
-    if candidate.is_empty() || !candidate.chars().next().unwrap().is_ascii_alphabetic() {
-        candidate.insert(0, '_');
-    }
-
-    while used.contains(&candidate) {
-        candidate.push('_');
-    }
-
-    used.insert(candidate.clone());
-    candidate
 }
 
 fn build_graphql_response(batch: BatchResponse) -> Result<Response, serde_json::Error> {
@@ -848,6 +1069,13 @@ impl AppState {
         guard.clone()
     }
 
+    pub async fn update_lexicon_size(&self, uid: &str, size: usize) {
+        let guard = self.lexica.read().await;
+        if let Some(runtime) = guard.get(uid) {
+            runtime.set_size(size);
+        }
+    }
+
     pub fn metrics(&self) -> Arc<Metrics> {
         Arc::clone(&self.metrics)
     }
@@ -871,6 +1099,7 @@ pub struct LexiconRuntime {
     pub properties: Vec<String>,
     pub field_types: BTreeMap<String, String>,
     pub array_fields: HashSet<String>,
+    size: AtomicUsize,
     graphql_schema: OnceCell<Arc<DynamicSchema>>,
 }
 
@@ -933,6 +1162,7 @@ impl LexiconRuntime {
             properties,
             field_types,
             array_fields,
+            size: AtomicUsize::new(0),
             graphql_schema: OnceCell::new(),
         }
     }
@@ -947,6 +1177,14 @@ impl LexiconRuntime {
 
     pub fn mapping_keys(&self) -> impl Iterator<Item = &String> {
         self.field_types.keys()
+    }
+
+    pub fn set_size(&self, value: usize) {
+        self.size.store(value, Ordering::SeqCst);
+    }
+
+    pub fn size(&self) -> usize {
+        self.size.load(Ordering::SeqCst)
     }
 
     fn graphql_schema(
@@ -975,12 +1213,6 @@ struct EntriesParams {
     size: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
-struct IdsParams {
-    #[serde(default)]
-    ids: Vec<String>,
-}
-
 fn lexicon_map(
     state: &AppState,
     lexica: &BTreeMap<String, Arc<LexiconRuntime>>,
@@ -1005,10 +1237,19 @@ fn lexicon_map(
 fn lexicon_overview(state: &AppState, runtime: &LexiconRuntime) -> Map<String, JsonValue> {
     let mut map = Map::new();
 
-    let mut props = vec![JsonValue::String("id".into())];
-    props.extend(runtime.properties.iter().cloned().map(JsonValue::String));
+    let mut props: Vec<String> = Vec::new();
+    props.push("id".into());
+    props.extend(runtime.properties.iter().cloned());
+    for extra in ["created", "xml"] {
+        if !props.iter().any(|value| value == extra) {
+            props.push(extra.into());
+        }
+    }
 
-    map.insert("properties".into(), JsonValue::Array(props));
+    map.insert(
+        "properties".into(),
+        JsonValue::Array(props.into_iter().map(JsonValue::String).collect()),
+    );
     map.insert(
         "query_types".into(),
         JsonValue::Array(
@@ -1037,6 +1278,7 @@ fn lexicon_overview(state: &AppState, runtime: &LexiconRuntime) -> Map<String, J
             endpoints
         }),
     );
+    map.insert("size".into(), JsonValue::from(runtime.size() as u64));
 
     for (key, value) in &runtime.descriptor.attributes {
         map.insert(key.clone(), value.clone());
@@ -1045,23 +1287,33 @@ fn lexicon_overview(state: &AppState, runtime: &LexiconRuntime) -> Map<String, J
     map
 }
 
-fn info_payload(info: &InfoConfig) -> JsonValue {
+fn info_payload(config: &KoshConfig) -> JsonValue {
     json!({
-        "desc": info.desc,
-        "link": info.link,
-        "mail": info.mail,
-        "repo": info.repo,
+        "conf": config
+            .conf
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        "desc": config.info.desc,
+        "link": config.info.link,
+        "mail": config.info.mail,
+        "name": config.name,
+        "repo": config.info.repo,
     })
 }
 
 fn swagger_document(state: &AppState, runtime: &LexiconRuntime, host: &str) -> JsonValue {
     let root = state.config.api.root.trim_end_matches('/');
     let base_path = format!("{root}/{}/restful", runtime.descriptor.uid);
-    let fields_enum: Vec<JsonValue> = runtime
-        .mapping_keys()
-        .cloned()
-        .map(JsonValue::String)
-        .collect();
+    let mut field_names: Vec<String> = Vec::new();
+    field_names.push("id".into());
+    field_names.extend(runtime.properties.iter().cloned());
+    for extra in ["created", "xml"] {
+        if !field_names.iter().any(|value| value == extra) {
+            field_names.push(extra.into());
+        }
+    }
+    let fields_enum: Vec<JsonValue> = field_names.iter().cloned().map(JsonValue::String).collect();
 
     let query_types_enum: Vec<JsonValue> = state
         .query_types
@@ -1149,7 +1401,14 @@ fn entry_definition(runtime: &LexiconRuntime) -> JsonValue {
     let mut properties = Map::new();
 
     for field in runtime.mapping_keys() {
-        let schema = swagger_field(runtime.field_type(field).unwrap_or("text"));
+        let schema = if field == "xml" {
+            let mut map = Map::new();
+            map.insert("type".into(), JsonValue::String("string".into()));
+            map.insert("format".into(), JsonValue::String("xml".into()));
+            JsonValue::Object(map)
+        } else {
+            swagger_field(runtime.field_type(field).unwrap_or("text"))
+        };
 
         if runtime.is_array(field) {
             let mut array = Map::new();
@@ -1291,6 +1550,8 @@ pub enum ArtifactError {
     Serialise(#[source] serde_json::Error),
     #[error("failed to build GraphQL schema")]
     Graph(#[source] GraphSchemaError),
+    #[error("failed to execute GraphQL introspection query: {0}")]
+    GraphIntrospection(String),
 }
 
 #[derive(Debug, Error)]
@@ -1323,8 +1584,8 @@ mod tests {
     use async_graphql::value;
     use async_graphql::Request as GraphRequest;
     use axum::extract::{Path, Query, State};
-    use axum::Json;
     use axum::http::StatusCode;
+    use axum::Json;
     use httpmock::MockServer;
     use kosh_core::index::elasticsearch::{ElasticsearchBackend, ElasticsearchConfig};
     use serde_json::json;
@@ -1434,6 +1695,15 @@ mod tests {
         assert!(overview.get("endpoints").is_some());
         assert!(overview.get("query_types").is_some());
         assert!(overview.get("properties").is_some());
+        assert_eq!(overview.get("size"), Some(&JsonValue::from(0)));
+
+        let properties = overview
+            .get("properties")
+            .and_then(JsonValue::as_array)
+            .expect("properties array");
+        let property_names: Vec<&str> = properties.iter().filter_map(JsonValue::as_str).collect();
+        assert!(property_names.contains(&"created"));
+        assert!(property_names.contains(&"xml"));
 
         let endpoints = overview
             .get("endpoints")
@@ -1737,9 +2007,7 @@ mod tests {
         let Json(body) = super::restful_ids(
             Path("demo".into()),
             State(Arc::clone(&state)),
-            Query(IdsParams {
-                ids: vec!["a".into(), "b".into()],
-            }),
+            RawQuery(Some("ids=a&ids=b".into())),
         )
         .await
         .unwrap_or_else(|problem| panic!("expected ids success, got status {}", problem.status()));
@@ -1749,6 +2017,100 @@ mod tests {
         let data = body["data"]["ids"].as_array().cloned().expect("ids array");
         assert_eq!(data.len(), 2);
         assert_eq!(data[0]["lemma"], JsonValue::String("Alpha".into()));
+        assert_eq!(data[0]["id"], JsonValue::String("a".into()));
+    }
+
+    #[tokio::test]
+    async fn restful_ids_accepts_bracket_notation() {
+        let server = MockServer::start_async().await;
+        let ids_mock = server
+            .mock_async(|when, then| {
+                when.method("POST").path("/_mget");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(
+                        r#"{
+                            "docs": [
+                                {"_id": "a", "found": true, "_source": {"lemma": "Alpha"}}
+                            ]
+                        }"#,
+                    );
+            })
+            .await;
+
+        let config = sample_config();
+        let lexicon = sample_lexicon("demo");
+        let backend = Arc::new(mock_backend(&server.base_url()));
+        let search_service = SearchService::new(Arc::clone(&backend));
+        let state = Arc::new(AppState::new(
+            config,
+            vec![lexicon],
+            vec!["match".into()],
+            search_service,
+            sample_metrics(),
+        ));
+
+        let Json(body) = super::restful_ids(
+            Path("demo".into()),
+            State(Arc::clone(&state)),
+            RawQuery(Some("ids[]=a".into())),
+        )
+        .await
+        .unwrap_or_else(|problem| {
+            panic!("expected ids[] success, got status {}", problem.status())
+        });
+
+        ids_mock.assert_async().await;
+
+        let data = body["data"]["ids"].as_array().cloned().expect("ids array");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["id"], JsonValue::String("a".into()));
+    }
+
+    #[tokio::test]
+    async fn restful_ids_accepts_indexed_notation() {
+        let server = MockServer::start_async().await;
+        let ids_mock = server
+            .mock_async(|when, then| {
+                when.method("POST").path("/_mget");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(
+                        r#"{
+                            "docs": [
+                                {"_id": "a", "found": true, "_source": {"lemma": "Alpha"}}
+                            ]
+                        }"#,
+                    );
+            })
+            .await;
+
+        let config = sample_config();
+        let lexicon = sample_lexicon("demo");
+        let backend = Arc::new(mock_backend(&server.base_url()));
+        let search_service = SearchService::new(Arc::clone(&backend));
+        let state = Arc::new(AppState::new(
+            config,
+            vec![lexicon],
+            vec!["match".into()],
+            search_service,
+            sample_metrics(),
+        ));
+
+        let Json(body) = super::restful_ids(
+            Path("demo".into()),
+            State(Arc::clone(&state)),
+            RawQuery(Some("ids[0]=a".into())),
+        )
+        .await
+        .unwrap_or_else(|problem| {
+            panic!("expected ids[0] success, got status {}", problem.status())
+        });
+
+        ids_mock.assert_async().await;
+
+        let data = body["data"]["ids"].as_array().cloned().expect("ids array");
+        assert_eq!(data.len(), 1);
         assert_eq!(data[0]["id"], JsonValue::String("a".into()));
     }
 
@@ -1768,7 +2130,7 @@ mod tests {
         let err = super::restful_ids(
             Path("demo".into()),
             State(Arc::clone(&state)),
-            Query(IdsParams { ids: Vec::new() }),
+            RawQuery(None),
         )
         .await
         .expect_err("expected empty ids error");
@@ -1805,6 +2167,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn entry_definition_marks_xml_field_with_format() {
+        let config = sample_config();
+        let lexicon = sample_lexicon("demo");
+        let search = SearchService::new(Arc::new(mock_backend("http://localhost:9200")));
+        let state = AppState::new(
+            config,
+            vec![lexicon.clone()],
+            vec!["match".into()],
+            search,
+            sample_metrics(),
+        );
+
+        let runtime = state.lexicon("demo").await.expect("lexicon");
+        let entry = super::entry_definition(&runtime);
+        let props = entry
+            .get("properties")
+            .and_then(JsonValue::as_object)
+            .expect("properties");
+        let xml = props
+            .get("xml")
+            .and_then(JsonValue::as_object)
+            .expect("xml schema");
+
+        assert_eq!(xml.get("type"), Some(&JsonValue::String("string".into())));
+        assert_eq!(xml.get("format"), Some(&JsonValue::String("xml".into())));
+    }
+
+    #[tokio::test]
     async fn graphql_entries_query_returns_results() {
         let server = MockServer::start_async().await;
 
@@ -1836,7 +2226,7 @@ mod tests {
 
         let response = schema
             .execute(GraphRequest::new(
-                "{ entries(field: LEMMA, query: \"foo\", query_type: MATCH) { id lemma } }",
+                "{ entries(field: lemma, query: \"foo\", queryType: match) { id lemma } }",
             ))
             .await
             .into_result()
@@ -1947,7 +2337,7 @@ mod tests {
 
         schema
             .execute(GraphRequest::new(
-                "{ entries(field: LEMMA, query: \"foo\", query_type: MATCH, size: 20000) { id } }",
+                "{ entries(field: lemma, query: \"foo\", queryType: match, size: 20000) { id } }",
             ))
             .await;
 
@@ -1973,7 +2363,7 @@ mod tests {
             .expect("artifacts");
 
         assert!(dir.path().join("openapi/demo.json").exists());
-        assert!(dir.path().join("graphql/demo.graphql").exists());
+        assert!(dir.path().join("graphql/demo_introspection.json").exists());
     }
 
     #[tokio::test]

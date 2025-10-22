@@ -7,6 +7,8 @@ Usage:
       --output-dir parity/python \
       --base-url http://127.0.0.1:6100 \
       --elastic-url http://127.0.0.1:9200 \
+      [--skip-openapi] \
+      [--skip-graphql-introspection] \
       --indices kosh[demo] kosh[demo_alt] \
       -- kosh --data-root fixtures/demo --data-host http://127.0.0.1:9200 --data-sync 0 --api-port 6100
 """
@@ -21,7 +23,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 from urllib.parse import quote
 
@@ -68,7 +70,19 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="Number of results requested in GraphQL sample queries",
     )
+    parser.add_argument(
+        "--skip-openapi",
+        action="store_true",
+        help="Reuse existing OpenAPI artefacts instead of fetching them over HTTP",
+    )
+    parser.add_argument(
+        "--skip-graphql-introspection",
+        action="store_true",
+        help="Reuse existing GraphQL introspection artefacts instead of querying the endpoint",
+    )
     args, command = parser.parse_known_args()
+    if command and command[0] == "--":
+        command = command[1:]
     if not command:
         parser.error("expected service command after '--'")
     args.command = command
@@ -139,6 +153,7 @@ def normalise_entries(entries: List[Dict]) -> List[Dict]:
         item = dict(entry)
         item.pop("created", None)
         normalised.append(item)
+    normalised.sort(key=lambda item: item.get("id", ""))
     return normalised
 
 
@@ -154,6 +169,8 @@ def capture_artifacts(
     output_dir: Path,
     query_token: str,
     graphql_size: int,
+    skip_openapi: bool,
+    skip_graphql_introspection: bool,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -168,8 +185,16 @@ def capture_artifacts(
         lex_resp = requests.get(f"{base_url}/api/{uid}", timeout=5).json()
         save_json(lexicon_dir / "metadata.json", lex_resp)
 
-        spec_resp = requests.get(f"{base_url}/api/{uid}/restful/spec", timeout=5).json()
-        save_json(output_dir / "openapi" / f"{uid}.json", normalise_spec(spec_resp))
+        spec_path = output_dir / "openapi" / f"{uid}.json"
+        if skip_openapi:
+            if not spec_path.exists():
+                raise RuntimeError(f"expected OpenAPI artefact at {spec_path}")
+            with spec_path.open("r", encoding="utf-8") as handle:
+                spec_resp = json.load(handle)
+        else:
+            spec_resp = requests.get(f"{base_url}/api/{uid}/restful/spec", timeout=5).json()
+        spec_resp = normalise_spec(spec_resp)
+        save_json(spec_path, spec_resp)
 
         fields = list(
             spec_resp.get("definitions", {})
@@ -202,49 +227,76 @@ def capture_artifacts(
         capture_entries("size1", 1)
         capture_entries("max", 10_000)
 
-        ids_payload = requests.get(
-            f"{base_url}/api/{uid}/restful/ids",
-            params=[("ids", f"{uid}-1"), ("ids", f"{uid}-2")],
-            timeout=5,
-        ).json()
-        ids_entries = ids_payload.get("data", {}).get("ids", [])
-        ids_payload["data"]["ids"] = normalise_entries(ids_entries)
+        def fetch_ids(params: List[Tuple[str, str]]) -> Tuple[requests.Response, Optional[Dict[str, Any]]]:
+            resp = requests.get(
+                f"{base_url}/api/{uid}/restful/ids",
+                params=params,
+                timeout=5,
+            )
+            try:
+                payload = resp.json()
+            except (json.JSONDecodeError, ValueError, requests.exceptions.JSONDecodeError):
+                payload = None
+            return resp, payload
+
+        ids_params = [("ids", f"{uid}-1"), ("ids", f"{uid}-2")]
+        ids_resp, ids_payload = fetch_ids(ids_params)
+        if ids_payload is None or ids_resp.status_code >= 400:
+            ids_resp, ids_payload = fetch_ids(
+                [("ids[]", f"{uid}-1"), ("ids[]", f"{uid}-2")]
+            )
+
+        if ids_payload is None:
+            ids_payload = {
+                "error": {
+                    "status": ids_resp.status_code,
+                    "body": ids_resp.text.strip(),
+                }
+            }
+        data_section = ids_payload.get("data")
+        if isinstance(data_section, dict):
+            ids_entries = data_section.get("ids", [])
+            data_section["ids"] = normalise_entries(ids_entries)
         save_json(lexicon_dir / "ids.json", ids_payload)
 
         if metadata.get("endpoints", {}).get("graphql"):
-            # GraphQL introspection
-            introspection = requests.post(
-                f"{base_url}/api/{uid}/graphql",
-                json={
-                    "query": """
-                    query IntrospectionQuery {
-                      __schema {
-                        queryType { name }
-                        types {
-                          kind
-                          name
-                          fields(includeDeprecated: true) {
-                            name
-                            type { kind name ofType { kind name } }
+            introspection_path = output_dir / "graphql" / f"{uid}_introspection.json"
+            if skip_graphql_introspection:
+                if not introspection_path.exists():
+                    raise RuntimeError(f"expected GraphQL introspection artefact at {introspection_path}")
+            else:
+                introspection = requests.post(
+                    f"{base_url}/api/{uid}/graphql",
+                    json={
+                        "query": """
+                        query IntrospectionQuery {
+                          __schema {
+                            queryType { name }
+                            types {
+                              kind
+                              name
+                              fields(includeDeprecated: true) {
+                                name
+                                type { kind name ofType { kind name } }
+                              }
+                              enumValues(includeDeprecated: true) { name }
+                            }
                           }
-                          enumValues(includeDeprecated: true) { name }
                         }
-                      }
-                    }
-                    """
-                },
-                timeout=10,
-            ).json()
-            save_json(output_dir / "graphql" / f"{uid}_introspection.json", introspection)
+                        """
+                    },
+                    timeout=10,
+                ).json()
+                save_json(introspection_path, introspection)
 
-            field_enum = field.upper()
-            query_enum = query_type.upper()
+            field_enum = field
+            query_enum = query_type
             entries_query = requests.post(
                 f"{base_url}/api/{uid}/graphql",
                 json={
                     "query": (
                         f"{{ entries(field: {field_enum}, query: \"{query_token}\", "
-                        f"query_type: {query_enum}, size: {graphql_size}) {{ id {field} }} }}"
+                        f"queryType: {query_enum}, size: {graphql_size}) {{ id {field} }} }}"
                     )
                 },
                 timeout=10,
@@ -266,6 +318,8 @@ def main() -> None:
             output_dir=output_dir,
             query_token=args.query_token,
             graphql_size=args.graphql_size,
+            skip_openapi=args.skip_openapi,
+            skip_graphql_introspection=args.skip_graphql_introspection,
         )
     finally:
         stop_service(proc)
