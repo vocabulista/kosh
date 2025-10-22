@@ -261,4 +261,23 @@ mod tests {
         assert_eq!(demo.get("files").unwrap().as_deref(), Some("[\"example.xml\"]"));
         assert_eq!(demo.get("schema").unwrap().as_deref(), Some("schema.json"));
     }
+
+    #[test]
+    fn discover_lexica_loads_multiple_sections() {
+        let root = PathBuf::from("tests/fixtures/multi");
+        let lexica = discover_lexica(&root, ".kosh", "kosh").expect("discover");
+        let mut uids: Vec<_> = lexica.iter().map(|l| l.uid.as_str()).collect();
+        uids.sort();
+        assert_eq!(uids, vec!["alpha", "beta", "gamma"]);
+
+        let alpha = lexica
+            .iter()
+            .find(|lex| lex.uid == "alpha")
+            .expect("alpha lexicon");
+        assert_eq!(alpha.files.len(), 1);
+        assert!(alpha
+            .schema
+            .pointer("/mappings/_meta/_xpaths/root")
+            .is_some());
+    }
 }

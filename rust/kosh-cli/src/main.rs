@@ -1034,6 +1034,8 @@ async fn rebuild_lexicon(
     };
 
     let mut documents = Vec::new();
+    let mut processed = 0usize;
+    let mut next_log = 500usize;
     for file in &lexicon.files {
         match parser.parse_file(file) {
             Ok(mut batch) => {
@@ -1044,7 +1046,18 @@ async fn rebuild_lexicon(
                     count = batch.len(),
                     "parsed lexicon file"
                 );
+                processed += batch.len();
                 documents.append(&mut batch);
+
+                while processed >= next_log {
+                    info!(
+                        phase,
+                        lexicon = %lexicon.uid,
+                        processed,
+                        "rebuild progress"
+                    );
+                    next_log += 500;
+                }
             }
             Err(err) => warn!(
                 phase,
