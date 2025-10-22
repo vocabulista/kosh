@@ -16,6 +16,7 @@ use sxd_xpath::{
 };
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
+use tracing::info;
 
 use super::{IndexDocument, IndexError};
 use crate::lexicon::LexiconDescriptor;
@@ -215,6 +216,25 @@ impl XmlEntryParser {
 
             let document = IndexDocument::new(identifier, payload)?;
             documents.push(document);
+
+            let processed = documents.len();
+            if processed % 500 == 0 {
+                info!(
+                    lexicon = %self.lexicon.uid,
+                    file = %path.display(),
+                    processed,
+                    "parsed lexicon records"
+                );
+            }
+        }
+
+        if !documents.is_empty() && documents.len() % 500 != 0 {
+            info!(
+                lexicon = %self.lexicon.uid,
+                file = %path.display(),
+                processed = documents.len(),
+                "parsed lexicon records"
+            );
         }
 
         Ok(documents)
