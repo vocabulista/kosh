@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use configparser::ini::Ini;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use thiserror::Error;
@@ -89,13 +88,7 @@ pub fn parse_spec(
         source,
     })?;
 
-    let mut ini = Ini::new();
-    let map = ini
-        .read(content)
-        .map_err(|details| LexiconError::ParseSpec {
-            path: path.to_path_buf(),
-            details,
-        })?;
+    let map = parse_spec_map(path.as_ref(), &content)?;
 
     let mut descriptors = Vec::new();
     let base_dir = path
@@ -161,6 +154,59 @@ pub fn parse_spec(
     Ok(descriptors)
 }
 
+fn parse_spec_map(
+    path: &Path,
+    input: &str,
+) -> Result<HashMap<String, HashMap<String, Option<String>>>, LexiconError> {
+    let mut map: HashMap<String, HashMap<String, Option<String>>> = HashMap::new();
+    let mut section = "default".to_string();
+
+    for (line_idx, raw_line) in input.lines().enumerate() {
+        let line = match raw_line
+            .split(|c| c == ';' || c == '#')
+            .next()
+            .map(|part| part.trim())
+        {
+            Some("") | None => continue,
+            Some(value) => value,
+        };
+
+        if let Some(rest) = line.strip_prefix('[') {
+            let Some(end_rel) = rest.find(']') else {
+                return Err(LexiconError::ParseSpec {
+                    path: path.to_path_buf(),
+                    details: format!("line {}: missing closing bracket for section", line_idx + 1),
+                });
+            };
+            section = rest[..end_rel].trim().to_lowercase();
+            map.entry(section.clone()).or_insert_with(HashMap::new);
+            continue;
+        }
+
+        let delimiter_pos = line.find(['=', ':']);
+        if let Some(pos) = delimiter_pos {
+            let key = line[..pos].trim().to_lowercase();
+            if key.is_empty() {
+                return Err(LexiconError::ParseSpec {
+                    path: path.to_path_buf(),
+                    details: format!("line {}: key cannot be empty", line_idx + 1),
+                });
+            }
+            let value = line[pos + 1..].trim().to_owned();
+            map.entry(section.clone())
+                .or_insert_with(HashMap::new)
+                .insert(key, Some(value));
+        } else {
+            let key = line.to_lowercase();
+            map.entry(section.clone())
+                .or_insert_with(HashMap::new)
+                .insert(key, None);
+        }
+    }
+
+    Ok(map)
+}
+
 fn required_value<'a>(
     path: &Path,
     section: &str,
@@ -200,4 +246,19 @@ fn parse_file_list(path: &Path, section: &str, raw: &str) -> Result<Vec<PathBuf>
 
 fn parse_attribute(raw: &str) -> JsonValue {
     serde_json::from_str(raw).unwrap_or_else(|_| JsonValue::String(raw.to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn parse_spec_map_handles_colon_assignments_and_arrays() {
+        let input = "[demo]\nfiles: [\"example.xml\"]\nschema: schema.json\n";
+        let map = parse_spec_map(&PathBuf::from("demo/.kosh"), input).expect("parse");
+        let demo = map.get("demo").expect("section");
+        assert_eq!(demo.get("files").unwrap().as_deref(), Some("[\"example.xml\"]"));
+        assert_eq!(demo.get("schema").unwrap().as_deref(), Some("schema.json"));
+    }
 }

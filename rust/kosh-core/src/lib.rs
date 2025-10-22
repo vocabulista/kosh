@@ -5,8 +5,8 @@ pub mod logging;
 pub mod search;
 
 pub use config::{
-    ApiConfig, ConfigError, DataConfig, InfoConfig, KoshConfig, LoggerConfig, NamespacesConfig,
-    QueryTypesConfig,
+    ApiConfig, ConfigError, DataConfig, InfoConfig, KoshConfig, LogFormat, LoggerConfig,
+    NamespacesConfig, QueryTypesConfig,
 };
 pub use index::{
     elasticsearch::{ElasticsearchBackend, ElasticsearchBackendError, ElasticsearchConfig},

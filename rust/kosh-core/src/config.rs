@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::num::ParseIntError;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use configparser::ini::Ini;
 use serde::{Deserialize, Serialize};
@@ -75,11 +76,26 @@ impl Default for InfoConfig {
     }
 }
 
+/// Supported output encodings for the logger.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    Text,
+    Json,
+}
+
+impl Default for LogFormat {
+    fn default() -> Self {
+        Self::Text
+    }
+}
+
 /// Logging related settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoggerConfig {
     pub level: String,
     pub file: Option<PathBuf>,
+    pub format: LogFormat,
 }
 
 impl Default for LoggerConfig {
@@ -87,6 +103,7 @@ impl Default for LoggerConfig {
         Self {
             level: "INFO".into(),
             file: None,
+            format: LogFormat::default(),
         }
     }
 }
@@ -100,6 +117,7 @@ impl Default for NamespacesConfig {
         let mut namespaces = BTreeMap::new();
         namespaces.insert("dc".into(), "http://purl.org/dc/elements/1.1".into());
         namespaces.insert("tei".into(), "http://www.tei-c.org/ns/1.0".into());
+        namespaces.insert("xml".into(), "http://www.w3.org/XML/1998/namespace".into());
         Self(namespaces)
     }
 }
@@ -272,6 +290,14 @@ impl KoshConfig {
                 Some(PathBuf::from(trimmed))
             };
         }
+        if let Some(format) = ini_value(map, "logger", "format") {
+            self.logger.format = format
+                .parse()
+                .map_err(|_| ConfigError::InvalidLogFormat {
+                    key: "logger.format".into(),
+                    value: format.to_owned(),
+                })?;
+        }
 
         if let Some(namespaces) = ini_section(map, "namespaces") {
             for (prefix, uri) in namespaces {
@@ -369,6 +395,8 @@ pub enum ConfigError {
     },
     #[error("invalid boolean for {key}: {value}")]
     InvalidBool { key: String, value: String },
+    #[error("invalid log format for {key}: {value}")]
+    InvalidLogFormat { key: String, value: String },
 }
 
 fn parse_u16(key: &str, value: &str) -> Result<u16, ConfigError> {
@@ -424,6 +452,18 @@ fn ini_value<'a>(
         .and_then(|value| value.as_deref())
 }
 
+impl FromStr for LogFormat {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "json" => Ok(LogFormat::Json),
+            "text" | "plain" | "pretty" => Ok(LogFormat::Text),
+            _ => Err(()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,6 +478,7 @@ mod tests {
         assert_eq!(config.api.port, 5000);
         assert_eq!(config.data.root, PathBuf::from("/var/lib/kosh"));
         assert_eq!(config.data.retry_backoff_secs, 5);
+        assert_eq!(config.logger.format, LogFormat::Text);
     }
 
     #[test]
@@ -507,5 +548,15 @@ mod tests {
             .expect("inline merge");
 
         assert_eq!(config.logger.level, "debug");
+    }
+
+    #[test]
+    fn logger_format_overrides_are_supported() {
+        let mut config = KoshConfig::default();
+        config
+            .merge_inline("[logger]\nformat = json\n")
+            .expect("inline merge");
+
+        assert_eq!(config.logger.format, LogFormat::Json);
     }
 }

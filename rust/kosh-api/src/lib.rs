@@ -27,7 +27,9 @@ use axum::{
 };
 use kosh_core::{ApiConfig, KoshConfig, LexiconDescriptor, SearchService};
 use once_cell::sync::OnceCell;
-use prometheus::{Encoder, IntCounterVec, Opts, Registry, TextEncoder};
+use prometheus::{
+    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder,
+};
 use serde::Deserialize;
 use serde_json::{json, Map, Value as JsonValue};
 use thiserror::Error;
@@ -880,6 +882,10 @@ pub struct Metrics {
     http_requests: IntCounterVec,
     search_failures: IntCounterVec,
     rebuild_outcomes: IntCounterVec,
+    rebuild_retries: IntCounterVec,
+    rebuild_quarantine: IntGaugeVec,
+    rebuild_latency: HistogramVec,
+    rebuild_quarantine_duration: HistogramVec,
 }
 
 impl Metrics {
@@ -925,11 +931,67 @@ impl Metrics {
             .register(Box::new(rebuild_outcomes.clone()))
             .map_err(MetricsError::Register)?;
 
+        let rebuild_retries = IntCounterVec::new(
+            Opts::new(
+                "rebuild_retries_total",
+                "Count of lexicon rebuild retries grouped by phase/reason",
+            )
+            .namespace("kosh"),
+            &["phase", "lexicon", "reason"],
+        )
+        .map_err(MetricsError::Register)?;
+        registry
+            .register(Box::new(rebuild_retries.clone()))
+            .map_err(MetricsError::Register)?;
+
+        let rebuild_quarantine = IntGaugeVec::new(
+            Opts::new(
+                "rebuild_quarantine_active",
+                "Gauge indicating whether a lexicon is currently quarantined by the rebuild circuit breaker",
+            )
+            .namespace("kosh"),
+            &["lexicon"],
+        )
+        .map_err(MetricsError::Register)?;
+        registry
+            .register(Box::new(rebuild_quarantine.clone()))
+            .map_err(MetricsError::Register)?;
+
+        let rebuild_latency = HistogramVec::new(
+            HistogramOpts::new(
+                "rebuild_latency_seconds",
+                "Histogram of lexicon rebuild durations grouped by phase/outcome",
+            )
+            .namespace("kosh"),
+            &["phase", "lexicon", "outcome"],
+        )
+        .map_err(MetricsError::Register)?;
+        registry
+            .register(Box::new(rebuild_latency.clone()))
+            .map_err(MetricsError::Register)?;
+
+        let rebuild_quarantine_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "rebuild_quarantine_duration_seconds",
+                "Histogram of quarantine durations applied by the rebuild circuit breaker",
+            )
+            .namespace("kosh"),
+            &["phase", "lexicon", "reason"],
+        )
+        .map_err(MetricsError::Register)?;
+        registry
+            .register(Box::new(rebuild_quarantine_duration.clone()))
+            .map_err(MetricsError::Register)?;
+
         Ok(Self {
             registry,
             http_requests,
             search_failures,
             rebuild_outcomes,
+            rebuild_retries,
+            rebuild_quarantine,
+            rebuild_latency,
+            rebuild_quarantine_duration,
         })
     }
 
@@ -950,6 +1012,37 @@ impl Metrics {
         self.rebuild_outcomes
             .with_label_values(&[phase, lexicon, outcome.as_label()])
             .inc();
+    }
+
+    pub fn record_rebuild_retry(&self, phase: &str, lexicon: &str, reason: &str) {
+        self.rebuild_retries
+            .with_label_values(&[phase, lexicon, reason])
+            .inc();
+    }
+
+    pub fn set_quarantine_active(&self, lexicon: &str, active: bool) {
+        let value = if active { 1 } else { 0 };
+        self.rebuild_quarantine
+            .with_label_values(&[lexicon])
+            .set(value);
+    }
+
+    pub fn observe_rebuild_latency(
+        &self,
+        phase: &str,
+        lexicon: &str,
+        outcome: RebuildOutcomeMetric,
+        seconds: f64,
+    ) {
+        self.rebuild_latency
+            .with_label_values(&[phase, lexicon, outcome.as_label()])
+            .observe(seconds);
+    }
+
+    pub fn observe_quarantine_duration(&self, phase: &str, lexicon: &str, reason: &str, seconds: f64) {
+        self.rebuild_quarantine_duration
+            .with_label_values(&[phase, lexicon, reason])
+            .observe(seconds);
     }
 
     pub fn render(&self) -> Result<String, MetricsError> {

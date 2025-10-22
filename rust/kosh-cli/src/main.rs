@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::error::Error as StdError;
 
 use clap::{CommandFactory, Parser};
 use kosh_api::{
@@ -14,7 +15,7 @@ use kosh_api::{
 use kosh_core::{
     discover_lexica, init_tracing, parse_spec, ConfigError, ElasticsearchBackend,
     ElasticsearchBackendError, ElasticsearchConfig, IndexError, IndexService, KoshConfig,
-    LexiconDescriptor, LexiconError, LoggingError, SearchService, XmlEntryParser,
+    LexiconDescriptor, LexiconError, LogFormat, LoggingError, SearchService, XmlEntryParser,
 };
 use notify::{
     event::{EventKind, ModifyKind, RenameMode},
@@ -51,6 +52,10 @@ struct Cli {
     /// Write logs to the specified file instead of stdout.
     #[arg(long = "log-file", alias = "log_file", value_name = "FILE")]
     log_file: Option<PathBuf>,
+
+    /// Choose the log output format (`text` or `json`).
+    #[arg(long = "log-format", alias = "log_format", value_name = "FORMAT")]
+    log_format: Option<String>,
 
     /// Override the Elasticsearch host used for indexing/search.
     #[arg(long = "data-host", alias = "data_host", value_name = "HOST")]
@@ -105,6 +110,12 @@ where
     })
 }
 
+fn parse_log_format(name: &str, raw: &str) -> Result<LogFormat, CliError> {
+    raw.parse::<LogFormat>().map_err(|_| CliError::InvalidArgument {
+        message: format!("invalid value '{raw}' for {name}: expected 'text' or 'json'"),
+    })
+}
+
 fn env_var(name: &str) -> Result<Option<String>, CliError> {
     match env::var(name) {
         Ok(value) => Ok(Some(value)),
@@ -128,6 +139,13 @@ fn apply_env_overrides(config: &mut KoshConfig) -> Result<(), CliError> {
             config.logger.file = None;
         } else {
             config.logger.file = Some(PathBuf::from(trimmed));
+        }
+    }
+
+    if let Some(value) = env_var("KOSH_LOG_FORMAT")? {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            config.logger.format = parse_log_format("KOSH_LOG_FORMAT", trimmed)?;
         }
     }
 
@@ -650,7 +668,14 @@ fn remove_uid(map: &mut HashMap<PathBuf, BTreeSet<String>>, path: &Path, uid: &s
 #[tokio::main]
 async fn main() {
     if let Err(err) = run().await {
-        error!(error = %err, "kosh terminated with error");
+        error!(error = %err, error_debug = ?err, "kosh terminated with error");
+        let mut source = err.source();
+        let mut depth = 0;
+        while let Some(cause) = source {
+            error!(cause = %cause, cause_debug = ?cause, depth, "error source");
+            source = cause.source();
+            depth += 1;
+        }
         std::process::exit(1);
     }
 }
@@ -678,6 +703,10 @@ async fn run() -> Result<(), CliError> {
 
     if let Some(file) = &cli.log_file {
         config.logger.file = Some(file.clone());
+    }
+
+    if let Some(format) = &cli.log_format {
+        config.logger.format = parse_log_format("--log-format", format)?;
     }
 
     if let Some(host) = &cli.data_host {
@@ -1079,10 +1108,13 @@ async fn execute_rebuild(
         if !should_attempt {
             debug!(phase, lexicon = %uid, "skip rebuild while lexicon is quarantined");
             metrics.record_rebuild(phase, &uid, RebuildOutcomeMetric::SkipWhileQuarantined);
+            metrics.set_quarantine_active(&uid, true);
             return;
         }
+        metrics.set_quarantine_active(&uid, false);
     }
 
+    let start = Instant::now();
     let result = rebuild_lexicon(
         Arc::clone(&lexicon),
         Arc::clone(&namespaces),
@@ -1090,19 +1122,40 @@ async fn execute_rebuild(
         phase,
     )
     .await;
+    let elapsed = start.elapsed();
+    let duration_secs = elapsed.as_secs_f64();
 
     match result {
         Ok(RebuildOutcome::Indexed { indexed }) => {
             metrics.record_rebuild(phase, &uid, RebuildOutcomeMetric::Success);
+            metrics.observe_rebuild_latency(phase, &uid, RebuildOutcomeMetric::Success, duration_secs);
             let mut guard = budget.write().await;
             guard.record_success(&uid);
+            metrics.set_quarantine_active(&uid, false);
             state.update_lexicon_size(&uid, indexed).await;
         }
         Ok(RebuildOutcome::SkippedNoDocuments) => {
             metrics.record_rebuild(phase, &uid, RebuildOutcomeMetric::SkippedEmpty);
-            let mut guard = budget.write().await;
-            if let Some(quarantine) = guard.record_failure(&uid) {
+            metrics.observe_rebuild_latency(
+                phase,
+                &uid,
+                RebuildOutcomeMetric::SkippedEmpty,
+                duration_secs,
+            );
+            let quarantine = {
+                let mut guard = budget.write().await;
+                guard.record_failure(&uid)
+            };
+            metrics.record_rebuild_retry(phase, &uid, "empty");
+            if let Some(quarantine) = quarantine {
+                metrics.set_quarantine_active(&uid, true);
                 let remaining = quarantine.until.saturating_duration_since(Instant::now());
+                metrics.observe_quarantine_duration(
+                    phase,
+                    &uid,
+                    "empty",
+                    remaining.as_secs_f64(),
+                );
                 info!(
                     phase,
                     lexicon = %uid,
@@ -1114,9 +1167,26 @@ async fn execute_rebuild(
         }
         Err(err) => {
             metrics.record_rebuild(phase, &uid, RebuildOutcomeMetric::Failure);
-            let mut guard = budget.write().await;
-            if let Some(quarantine) = guard.record_failure(&uid) {
+            metrics.observe_rebuild_latency(
+                phase,
+                &uid,
+                RebuildOutcomeMetric::Failure,
+                duration_secs,
+            );
+            let quarantine = {
+                let mut guard = budget.write().await;
+                guard.record_failure(&uid)
+            };
+            metrics.record_rebuild_retry(phase, &uid, "error");
+            if let Some(quarantine) = quarantine {
+                metrics.set_quarantine_active(&uid, true);
                 let remaining = quarantine.until.saturating_duration_since(Instant::now());
+                metrics.observe_quarantine_duration(
+                    phase,
+                    &uid,
+                    "error",
+                    remaining.as_secs_f64(),
+                );
                 warn!(
                     phase,
                     lexicon = %uid,
@@ -1277,7 +1347,7 @@ fn normalise_endpoint(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_env_overrides, apply_incremental_updates, normalise_endpoint,
+        apply_env_overrides, apply_incremental_updates, normalise_endpoint, LogFormat,
         path_changes_from_event, rescan_lexica, ChangeKind, FailureBudget, LexiconRegistry,
         PathChange,
     };
@@ -1344,6 +1414,7 @@ mod tests {
     fn environment_overrides_update_config() {
         let _log_level = EnvGuard::set("KOSH_LOG_LEVEL", "DEBUG");
         let _log_file = EnvGuard::set("KOSH_LOG_FILE", "/tmp/kosh.log");
+        let _log_format = EnvGuard::set("KOSH_LOG_FORMAT", "json");
         let _data_sync = EnvGuard::set("KOSH_DATA_SYNC", "15");
         let _api_port = EnvGuard::set("KOSH_API_PORT", "7001");
 
@@ -1352,6 +1423,7 @@ mod tests {
 
         assert_eq!(config.logger.level, "DEBUG");
         assert_eq!(config.logger.file, Some(PathBuf::from("/tmp/kosh.log")));
+        assert_eq!(config.logger.format, LogFormat::Json);
         assert_eq!(config.data.sync, 15);
         assert_eq!(config.api.port, 7001);
     }

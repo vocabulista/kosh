@@ -26,7 +26,7 @@ serde_json = "1"
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 notify = "6"
 walkdir = "2"
 sxd-document = "0.3"
