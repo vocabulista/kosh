@@ -10,7 +10,7 @@ pub use config::{
 };
 pub use index::{
     elasticsearch::{ElasticsearchBackend, ElasticsearchBackendError, ElasticsearchConfig},
-    parser::{LexiconXpaths, ParserError, XmlEntryParser},
+    parser::{LexiconXpaths, ParserError, ParserMode, XmlEntryParser},
     IndexBackend, IndexDocument, IndexError, IndexService, IndexStats,
 };
 pub use lexicon::{discover_lexica, parse_spec, LexiconDescriptor, LexiconError};

@@ -8,4 +8,12 @@ To search in the APIs of the reference implementations, please visit:
 
 ## Rust Service
 
-Operational guidance for the Rust implementation (build steps, Docker Compose, configuration, monitoring, and alerting) lives in `docs/kosh-rust-ops-runbook.md`. Prometheus alert rules are provided in `docs/kosh-rust-alerts.yaml`.
+Operational guidance for the Rust implementation lives in two places:
+
+- **Quick reference in-repo:** see `KOSH_RUST_GUIDE.md` for the commands, config flags, and metrics
+  you need day-to-day.
+- **Long-form docs:** the detailed runbook, alert catalogue, and migration history live in the
+  companion documentation repository (`kosh_docs/kosh-rust-ops-runbook.md`).
+
+Prometheus alert rules are provided alongside the external docs, and the bundled Grafana dashboard
+ships under `monitoring/grafana/dashboards/kosh-metrics-overview.json` here.

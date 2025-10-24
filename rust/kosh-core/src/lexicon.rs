@@ -251,21 +251,65 @@ fn parse_attribute(raw: &str) -> JsonValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::path::PathBuf;
+    use tempfile::tempdir;
 
     #[test]
     fn parse_spec_map_handles_colon_assignments_and_arrays() {
         let input = "[demo]\nfiles: [\"example.xml\"]\nschema: schema.json\n";
         let map = parse_spec_map(&PathBuf::from("demo/.kosh"), input).expect("parse");
         let demo = map.get("demo").expect("section");
-        assert_eq!(demo.get("files").unwrap().as_deref(), Some("[\"example.xml\"]"));
+        assert_eq!(
+            demo.get("files").unwrap().as_deref(),
+            Some("[\"example.xml\"]")
+        );
         assert_eq!(demo.get("schema").unwrap().as_deref(), Some("schema.json"));
     }
 
     #[test]
     fn discover_lexica_loads_multiple_sections() {
-        let root = PathBuf::from("tests/fixtures/multi");
-        let lexica = discover_lexica(&root, ".kosh", "kosh").expect("discover");
+        let dir = tempdir().expect("temp root");
+
+        for (uid, lemma) in [("alpha", "Alpha"), ("beta", "Beta"), ("gamma", "Gamma")] {
+            let lex_dir = dir.path().join(uid);
+            fs::create_dir_all(&lex_dir).expect("lex dir");
+
+            fs::write(
+                lex_dir.join("schema.json"),
+                r#"{
+    "mappings": {
+        "properties": {},
+        "_meta": {
+            "_xpaths": {
+                "root": "/items/item",
+                "id": "id/text()",
+                "fields": { "lemma": "lemma/text()" }
+            }
+        }
+    }
+}"#,
+            )
+            .expect("schema");
+
+            fs::write(
+                lex_dir.join("entries.xml"),
+                format!(
+                    "<items><item><id>{}</id><lemma>{}</lemma></item></items>",
+                    uid, lemma
+                ),
+            )
+            .expect("xml");
+
+            fs::write(
+                lex_dir.join(".kosh"),
+                "[default]\npool = kube\n\n".to_string()
+                    + &format!("[{uid}]\nfiles = entries.xml\nschema = schema.json\n"),
+            )
+            .expect("spec");
+        }
+
+        let lexica = discover_lexica(dir.path(), ".kosh", "kosh").expect("discover");
         let mut uids: Vec<_> = lexica.iter().map(|l| l.uid.as_str()).collect();
         uids.sort();
         assert_eq!(uids, vec!["alpha", "beta", "gamma"]);

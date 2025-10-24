@@ -25,6 +25,7 @@ pub struct ElasticsearchConfig {
     pub request_timeout_secs: u64,
     pub max_retries: u32,
     pub retry_backoff_secs: u64,
+    pub bulk_batch_size: usize,
 }
 
 impl Default for ElasticsearchConfig {
@@ -37,6 +38,7 @@ impl Default for ElasticsearchConfig {
             request_timeout_secs: 60,
             max_retries: 3,
             retry_backoff_secs: 5,
+            bulk_batch_size: 5_000,
         }
     }
 }
@@ -51,7 +53,9 @@ pub struct ElasticsearchBackend {
 
 impl ElasticsearchBackend {
     /// Create a backend from the supplied configuration, preparing the HTTP client.
-    pub fn new(config: ElasticsearchConfig) -> Result<Self, ElasticsearchBackendError> {
+    pub fn new(mut config: ElasticsearchConfig) -> Result<Self, ElasticsearchBackendError> {
+        config.bulk_batch_size = config.bulk_batch_size.max(1);
+
         let timeout = StdDuration::from_secs(config.request_timeout_secs.max(1));
         let mut builder = Client::builder().timeout(timeout);
 
@@ -78,7 +82,8 @@ impl ElasticsearchBackend {
     /// Convert the backend into an [`IndexService`] ready for use by higher layers.
     pub fn into_service(self) -> IndexService<Self> {
         info!(endpoint = %self.base, "initialised Elasticsearch backend");
-        IndexService::new(Arc::new(self))
+        let chunk_size = self.config.bulk_batch_size;
+        IndexService::with_chunk_size(Arc::new(self), chunk_size)
     }
 
     /// Perform a lightweight health check against the configured endpoint.
@@ -617,6 +622,7 @@ mod tests {
             request_timeout_secs: 5,
             max_retries: 1,
             retry_backoff_secs: 1,
+            bulk_batch_size: 5_000,
         };
 
         let result = ElasticsearchBackend::new(config);

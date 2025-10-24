@@ -10,3 +10,4 @@ parity/
 *.md
 !README.md
 !**/README.md
+!KOSH_RUST_GUIDE.md

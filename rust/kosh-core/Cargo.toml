@@ -23,6 +23,7 @@ unicode-normalization = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
+quick-xml = "0.31"
 
 [dev-dependencies]
 tempfile = "3"

@@ -39,6 +39,8 @@ pub struct DataConfig {
     pub sync: u32,
     pub wait: u32,
     pub retry_backoff_secs: u32,
+    pub bulk_batch_size: u32,
+    pub streaming_parser: bool,
 }
 
 impl Default for DataConfig {
@@ -52,6 +54,8 @@ impl Default for DataConfig {
             sync: 10,
             wait: 60,
             retry_backoff_secs: 5,
+            bulk_batch_size: 5_000,
+            streaming_parser: false,
         }
     }
 }
@@ -265,6 +269,16 @@ impl KoshConfig {
         {
             self.data.retry_backoff_secs = parse_u32("data.retry_backoff_secs", backoff)?;
         }
+        if let Some(batch_size) = ini_value(map, "data", "bulk_batch_size")
+            .or_else(|| ini_value(map, "data", "bulk_batch"))
+        {
+            self.data.bulk_batch_size = parse_u32("data.bulk_batch_size", batch_size)?;
+        }
+        if let Some(streaming) = ini_value(map, "data", "streaming_parser")
+            .or_else(|| ini_value(map, "data", "streaming-parser"))
+        {
+            self.data.streaming_parser = parse_bool("data.streaming_parser", streaming)?;
+        }
 
         if let Some(desc) = ini_value(map, "info", "desc") {
             self.info.desc = desc.to_owned();
@@ -291,12 +305,10 @@ impl KoshConfig {
             };
         }
         if let Some(format) = ini_value(map, "logger", "format") {
-            self.logger.format = format
-                .parse()
-                .map_err(|_| ConfigError::InvalidLogFormat {
-                    key: "logger.format".into(),
-                    value: format.to_owned(),
-                })?;
+            self.logger.format = format.parse().map_err(|_| ConfigError::InvalidLogFormat {
+                key: "logger.format".into(),
+                value: format.to_owned(),
+            })?;
         }
 
         if let Some(namespaces) = ini_section(map, "namespaces") {
@@ -478,6 +490,8 @@ mod tests {
         assert_eq!(config.api.port, 5000);
         assert_eq!(config.data.root, PathBuf::from("/var/lib/kosh"));
         assert_eq!(config.data.retry_backoff_secs, 5);
+        assert_eq!(config.data.bulk_batch_size, 5_000);
+        assert!(!config.data.streaming_parser);
         assert_eq!(config.logger.format, LogFormat::Text);
     }
 
@@ -497,6 +511,8 @@ mod tests {
         assert_eq!(config.data.root, PathBuf::from("/srv/kosh"));
         assert_eq!(config.data.pool, "custom");
         assert_eq!(config.data.retry_backoff_secs, 5);
+        assert_eq!(config.data.bulk_batch_size, 5_000);
+        assert!(!config.data.streaming_parser);
     }
 
     #[test]
@@ -520,6 +536,26 @@ mod tests {
         let config = KoshConfig::from_optional_file(Some(file.path())).expect("load config");
 
         assert_eq!(config.data.retry_backoff_secs, 4);
+    }
+
+    #[test]
+    fn bulk_batch_size_override_is_applied() {
+        let mut file = NamedTempFile::new().expect("temp file");
+        writeln!(file, "[data]\nbulk_batch_size = 1234\n").expect("write config");
+
+        let config = KoshConfig::from_optional_file(Some(file.path())).expect("load config");
+
+        assert_eq!(config.data.bulk_batch_size, 1_234);
+    }
+
+    #[test]
+    fn streaming_parser_override_is_applied() {
+        let mut file = NamedTempFile::new().expect("temp file");
+        writeln!(file, "[data]\nstreaming_parser = true\n").expect("write config");
+
+        let config = KoshConfig::from_optional_file(Some(file.path())).expect("load config");
+
+        assert!(config.data.streaming_parser);
     }
 
     #[test]

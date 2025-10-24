@@ -221,6 +221,7 @@ mod tests {
             request_timeout_secs: 5,
             max_retries: 1,
             retry_backoff_secs: 1,
+            bulk_batch_size: 5_000,
         };
 
         Arc::new(ElasticsearchBackend::new(config).expect("backend"))

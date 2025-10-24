@@ -1,11 +1,11 @@
 use std::collections::{BTreeSet, HashMap};
 use std::env::{self, VarError};
+use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::error::Error as StdError;
 
 use clap::{CommandFactory, Parser};
 use kosh_api::{
@@ -15,7 +15,8 @@ use kosh_api::{
 use kosh_core::{
     discover_lexica, init_tracing, parse_spec, ConfigError, ElasticsearchBackend,
     ElasticsearchBackendError, ElasticsearchConfig, IndexError, IndexService, KoshConfig,
-    LexiconDescriptor, LexiconError, LogFormat, LoggingError, SearchService, XmlEntryParser,
+    LexiconDescriptor, LexiconError, LogFormat, LoggingError, ParserMode, SearchService,
+    XmlEntryParser,
 };
 use notify::{
     event::{EventKind, ModifyKind, RenameMode},
@@ -73,6 +74,18 @@ struct Cli {
     #[arg(long = "data-sync", alias = "data_sync", value_name = "SECONDS")]
     data_sync: Option<u32>,
 
+    /// Override bulk indexing batch size.
+    #[arg(
+        long = "data-bulk-batch-size",
+        alias = "data_bulk_batch_size",
+        value_name = "COUNT"
+    )]
+    data_bulk_batch_size: Option<u32>,
+
+    /// Enable the streaming XML parser for large dictionaries.
+    #[arg(long = "data-streaming-parser", alias = "data_streaming_parser")]
+    data_streaming_parser: bool,
+
     /// Override API root path (must start with '/').
     #[arg(long = "api-root", alias = "api_root", value_name = "PATH")]
     api_root: Option<String>,
@@ -111,9 +124,10 @@ where
 }
 
 fn parse_log_format(name: &str, raw: &str) -> Result<LogFormat, CliError> {
-    raw.parse::<LogFormat>().map_err(|_| CliError::InvalidArgument {
-        message: format!("invalid value '{raw}' for {name}: expected 'text' or 'json'"),
-    })
+    raw.parse::<LogFormat>()
+        .map_err(|_| CliError::InvalidArgument {
+            message: format!("invalid value '{raw}' for {name}: expected 'text' or 'json'"),
+        })
 }
 
 fn env_var(name: &str) -> Result<Option<String>, CliError> {
@@ -200,6 +214,31 @@ fn apply_env_overrides(config: &mut KoshConfig) -> Result<(), CliError> {
         if !trimmed.is_empty() {
             config.data.retry_backoff_secs =
                 parse_env_value("KOSH_DATA_RETRY_BACKOFF_SECS", trimmed)?;
+        }
+    }
+
+    if let Some(value) = env_var("KOSH_DATA_BULK_BATCH_SIZE")? {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            config.data.bulk_batch_size = parse_env_value("KOSH_DATA_BULK_BATCH_SIZE", trimmed)?;
+        }
+    }
+
+    if let Some(value) = env_var("KOSH_DATA_STREAMING_PARSER")? {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            let lowered = trimmed.to_ascii_lowercase();
+            config.data.streaming_parser = match lowered.as_str() {
+                "1" | "true" | "yes" => true,
+                "0" | "false" | "no" => false,
+                _ => {
+                    return Err(CliError::InvalidArgument {
+                        message: format!(
+                            "invalid value '{trimmed}' for KOSH_DATA_STREAMING_PARSER: expected true/false"
+                        ),
+                    })
+                }
+            };
         }
     }
 
@@ -725,6 +764,14 @@ async fn run() -> Result<(), CliError> {
         config.data.sync = sync;
     }
 
+    if let Some(batch) = cli.data_bulk_batch_size {
+        config.data.bulk_batch_size = batch.max(1);
+    }
+
+    if cli.data_streaming_parser {
+        config.data.streaming_parser = true;
+    }
+
     if let Some(api_root) = &cli.api_root {
         if !api_root.starts_with('/') {
             return Err(CliError::InvalidArgument {
@@ -759,6 +806,7 @@ async fn run() -> Result<(), CliError> {
         request_timeout_secs: u64::from(config.data.wait.max(1)),
         max_retries: config.data.r#loop.max(1),
         retry_backoff_secs: u64::from(config.data.retry_backoff_secs.max(1)),
+        bulk_batch_size: config.data.bulk_batch_size.max(1) as usize,
     };
 
     let metrics = Arc::new(Metrics::new().map_err(CliError::Metrics)?);
@@ -771,6 +819,11 @@ async fn run() -> Result<(), CliError> {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     let namespaces = Arc::new(namespaces);
+    let parser_mode = if config.data.streaming_parser {
+        ParserMode::Streaming
+    } else {
+        ParserMode::Dom
+    };
 
     let shared_lexica: Vec<_> = lexica.into_iter().map(Arc::new).collect();
     let registry = Arc::new(RwLock::new(LexiconRegistry::new(
@@ -820,6 +873,7 @@ async fn run() -> Result<(), CliError> {
             metrics_clone,
             "bootstrap",
             false,
+            parser_mode,
         )));
     }
 
@@ -846,6 +900,7 @@ async fn run() -> Result<(), CliError> {
                 watch_service,
                 watch_registry,
                 watch_budget,
+                parser_mode,
             )
             .await
             {
@@ -958,6 +1013,7 @@ async fn apply_incremental_updates(
     index_service: IndexService<ElasticsearchBackend>,
     registry: Arc<RwLock<LexiconRegistry>>,
     budget: Arc<RwLock<FailureBudget>>,
+    parser_mode: ParserMode,
     changes: Vec<PathChange>,
 ) -> Result<(), WatchError> {
     if changes.is_empty() {
@@ -1005,6 +1061,7 @@ async fn apply_incremental_updates(
             Arc::clone(&metrics),
             "watcher",
             true,
+            parser_mode,
         )
         .await;
     }
@@ -1012,9 +1069,19 @@ async fn apply_incremental_updates(
     Ok(())
 }
 
+struct RebuildTimings {
+    parse_seconds: f64,
+    index_seconds: f64,
+}
+
 enum RebuildOutcome {
-    Indexed { indexed: usize },
-    SkippedNoDocuments,
+    Indexed {
+        indexed: usize,
+        timings: RebuildTimings,
+    },
+    SkippedNoDocuments {
+        parse_seconds: f64,
+    },
 }
 
 async fn rebuild_lexicon(
@@ -1022,65 +1089,80 @@ async fn rebuild_lexicon(
     namespaces: Arc<HashMap<String, String>>,
     service: IndexService<ElasticsearchBackend>,
     phase: &'static str,
+    parser_mode: ParserMode,
 ) -> Result<RebuildOutcome, IndexError> {
     debug!(phase, lexicon = %lexicon.uid, "rebuild task started");
 
-    let parser = match XmlEntryParser::new(Arc::clone(&lexicon), namespaces.as_ref().clone()) {
-        Ok(parser) => parser,
-        Err(err) => {
-            warn!(phase, lexicon = %lexicon.uid, error = %err, "failed to prepare XML parser");
-            return Err(IndexError::backend(err.to_string()));
-        }
-    };
+    let (documents, parse_seconds) = {
+        let parser = match XmlEntryParser::new(
+            Arc::clone(&lexicon),
+            namespaces.as_ref().clone(),
+            parser_mode,
+        ) {
+            Ok(parser) => parser,
+            Err(err) => {
+                warn!(phase, lexicon = %lexicon.uid, error = %err, "failed to prepare XML parser");
+                return Err(IndexError::backend(err.to_string()));
+            }
+        };
 
-    let mut documents = Vec::new();
-    let mut processed = 0usize;
-    let mut next_log = 500usize;
-    for file in &lexicon.files {
-        match parser.parse_file(file) {
-            Ok(mut batch) => {
-                debug!(
+        let parse_start = Instant::now();
+        let mut documents = Vec::new();
+        let mut processed = 0usize;
+        let mut next_log = 500usize;
+        for file in &lexicon.files {
+            match parser.parse_file(file) {
+                Ok(mut batch) => {
+                    debug!(
+                        phase,
+                        lexicon = %lexicon.uid,
+                        file = %file.display(),
+                        count = batch.len(),
+                        "parsed lexicon file"
+                    );
+                    processed += batch.len();
+                    documents.append(&mut batch);
+
+                    while processed >= next_log {
+                        info!(
+                            phase,
+                            lexicon = %lexicon.uid,
+                            processed,
+                            "rebuild progress"
+                        );
+                        next_log += 500;
+                    }
+                }
+                Err(err) => warn!(
                     phase,
                     lexicon = %lexicon.uid,
                     file = %file.display(),
-                    count = batch.len(),
-                    "parsed lexicon file"
-                );
-                processed += batch.len();
-                documents.append(&mut batch);
-
-                while processed >= next_log {
-                    info!(
-                        phase,
-                        lexicon = %lexicon.uid,
-                        processed,
-                        "rebuild progress"
-                    );
-                    next_log += 500;
-                }
+                    error = %err,
+                    "failed to parse lexicon file"
+                ),
             }
-            Err(err) => warn!(
-                phase,
-                lexicon = %lexicon.uid,
-                file = %file.display(),
-                error = %err,
-                "failed to parse lexicon file"
-            ),
         }
-    }
 
-    if documents.is_empty() {
-        debug!(phase, lexicon = %lexicon.uid, "no documents produced during rebuild");
-    }
+        if documents.is_empty() {
+            debug!(phase, lexicon = %lexicon.uid, "no documents produced during rebuild");
+        }
 
-    match service.rebuild(lexicon.as_ref(), documents).await {
+        let parse_seconds = parse_start.elapsed().as_secs_f64();
+        (documents, parse_seconds)
+    };
+
+    let index_start = Instant::now();
+    let rebuild_result = service.rebuild(lexicon.as_ref(), documents).await;
+    let index_seconds = index_start.elapsed().as_secs_f64();
+
+    match rebuild_result {
         Err(IndexError::NoDocuments { .. }) => {
             debug!(
                 phase,
                 lexicon = %lexicon.uid,
                 "skipping rebuild until document ingestion is available"
             );
-            Ok(RebuildOutcome::SkippedNoDocuments)
+            Ok(RebuildOutcome::SkippedNoDocuments { parse_seconds })
         }
         Err(err) => {
             warn!(phase, lexicon = %lexicon.uid, error = %err, "index rebuild failed");
@@ -1095,6 +1177,10 @@ async fn rebuild_lexicon(
             );
             Ok(RebuildOutcome::Indexed {
                 indexed: stats.indexed,
+                timings: RebuildTimings {
+                    parse_seconds,
+                    index_seconds,
+                },
             })
         }
     }
@@ -1109,6 +1195,7 @@ async fn execute_rebuild(
     metrics: Arc<Metrics>,
     phase: &'static str,
     respect_quarantine: bool,
+    parser_mode: ParserMode,
 ) {
     let uid = lexicon.uid.clone();
 
@@ -1133,21 +1220,35 @@ async fn execute_rebuild(
         Arc::clone(&namespaces),
         service.clone(),
         phase,
+        parser_mode,
     )
     .await;
     let elapsed = start.elapsed();
     let duration_secs = elapsed.as_secs_f64();
 
     match result {
-        Ok(RebuildOutcome::Indexed { indexed }) => {
+        Ok(RebuildOutcome::Indexed { indexed, timings }) => {
+            metrics.observe_parser_duration(phase, &uid, timings.parse_seconds);
+            metrics.observe_bulk_latency(
+                phase,
+                &uid,
+                RebuildOutcomeMetric::Success,
+                timings.index_seconds,
+            );
             metrics.record_rebuild(phase, &uid, RebuildOutcomeMetric::Success);
-            metrics.observe_rebuild_latency(phase, &uid, RebuildOutcomeMetric::Success, duration_secs);
+            metrics.observe_rebuild_latency(
+                phase,
+                &uid,
+                RebuildOutcomeMetric::Success,
+                duration_secs,
+            );
             let mut guard = budget.write().await;
             guard.record_success(&uid);
             metrics.set_quarantine_active(&uid, false);
             state.update_lexicon_size(&uid, indexed).await;
         }
-        Ok(RebuildOutcome::SkippedNoDocuments) => {
+        Ok(RebuildOutcome::SkippedNoDocuments { parse_seconds }) => {
+            metrics.observe_parser_duration(phase, &uid, parse_seconds);
             metrics.record_rebuild(phase, &uid, RebuildOutcomeMetric::SkippedEmpty);
             metrics.observe_rebuild_latency(
                 phase,
@@ -1163,12 +1264,7 @@ async fn execute_rebuild(
             if let Some(quarantine) = quarantine {
                 metrics.set_quarantine_active(&uid, true);
                 let remaining = quarantine.until.saturating_duration_since(Instant::now());
-                metrics.observe_quarantine_duration(
-                    phase,
-                    &uid,
-                    "empty",
-                    remaining.as_secs_f64(),
-                );
+                metrics.observe_quarantine_duration(phase, &uid, "empty", remaining.as_secs_f64());
                 info!(
                     phase,
                     lexicon = %uid,
@@ -1194,12 +1290,7 @@ async fn execute_rebuild(
             if let Some(quarantine) = quarantine {
                 metrics.set_quarantine_active(&uid, true);
                 let remaining = quarantine.until.saturating_duration_since(Instant::now());
-                metrics.observe_quarantine_duration(
-                    phase,
-                    &uid,
-                    "error",
-                    remaining.as_secs_f64(),
-                );
+                metrics.observe_quarantine_duration(phase, &uid, "error", remaining.as_secs_f64());
                 warn!(
                     phase,
                     lexicon = %uid,
@@ -1220,6 +1311,7 @@ async fn rescan_lexica(
     index_service: IndexService<ElasticsearchBackend>,
     registry: Arc<RwLock<LexiconRegistry>>,
     budget: Arc<RwLock<FailureBudget>>,
+    parser_mode: ParserMode,
 ) -> Result<(), WatchError> {
     let lexica = discover_lexica(&config.data.root, &config.data.spec, &config.data.pool)
         .map_err(WatchError::Lexicon)?;
@@ -1258,6 +1350,7 @@ async fn rescan_lexica(
             Arc::clone(&metrics),
             "watcher",
             true,
+            parser_mode,
         )
         .await;
     }
@@ -1272,6 +1365,7 @@ async fn watch_lexica(
     index_service: IndexService<ElasticsearchBackend>,
     registry: Arc<RwLock<LexiconRegistry>>,
     budget: Arc<RwLock<FailureBudget>>,
+    parser_mode: ParserMode,
 ) -> Result<(), WatchError> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
 
@@ -1313,6 +1407,7 @@ async fn watch_lexica(
                 index_service.clone(),
                 Arc::clone(&registry),
                 Arc::clone(&budget),
+                parser_mode,
             )
             .await
             {
@@ -1336,6 +1431,7 @@ async fn watch_lexica(
             index_service.clone(),
             Arc::clone(&registry),
             Arc::clone(&budget),
+            parser_mode,
             changes,
         )
         .await
@@ -1360,9 +1456,9 @@ fn normalise_endpoint(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_env_overrides, apply_incremental_updates, normalise_endpoint, LogFormat,
+        apply_env_overrides, apply_incremental_updates, normalise_endpoint,
         path_changes_from_event, rescan_lexica, ChangeKind, FailureBudget, LexiconRegistry,
-        PathChange,
+        LogFormat, ParserMode, PathChange,
     };
     use httpmock::MockServer;
     use kosh_api::{AppState, Metrics};
@@ -1543,6 +1639,7 @@ mod tests {
             request_timeout_secs: 5,
             max_retries: 1,
             retry_backoff_secs: 1,
+            bulk_batch_size: 5_000,
         };
         let backend = Arc::new(ElasticsearchBackend::new(es_config).expect("backend"));
         let index_service = IndexService::new(Arc::clone(&backend));
@@ -1581,6 +1678,7 @@ mod tests {
             index_service.clone(),
             Arc::clone(&registry),
             Arc::clone(&budget),
+            ParserMode::Dom,
         )
         .await
         .expect("initial rescan");
@@ -1605,6 +1703,7 @@ mod tests {
             index_service.clone(),
             Arc::clone(&registry),
             Arc::clone(&budget),
+            ParserMode::Dom,
             changes,
         )
         .await

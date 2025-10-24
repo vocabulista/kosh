@@ -886,6 +886,8 @@ pub struct Metrics {
     rebuild_quarantine: IntGaugeVec,
     rebuild_latency: HistogramVec,
     rebuild_quarantine_duration: HistogramVec,
+    parser_duration: HistogramVec,
+    bulk_latency: HistogramVec,
 }
 
 impl Metrics {
@@ -983,6 +985,32 @@ impl Metrics {
             .register(Box::new(rebuild_quarantine_duration.clone()))
             .map_err(MetricsError::Register)?;
 
+        let parser_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "parser_duration_seconds",
+                "Histogram of lexicon parsing durations grouped by phase",
+            )
+            .namespace("kosh"),
+            &["phase", "lexicon"],
+        )
+        .map_err(MetricsError::Register)?;
+        registry
+            .register(Box::new(parser_duration.clone()))
+            .map_err(MetricsError::Register)?;
+
+        let bulk_latency = HistogramVec::new(
+            HistogramOpts::new(
+                "bulk_latency_seconds",
+                "Histogram of bulk indexing durations grouped by phase/outcome",
+            )
+            .namespace("kosh"),
+            &["phase", "lexicon", "outcome"],
+        )
+        .map_err(MetricsError::Register)?;
+        registry
+            .register(Box::new(bulk_latency.clone()))
+            .map_err(MetricsError::Register)?;
+
         Ok(Self {
             registry,
             http_requests,
@@ -992,6 +1020,8 @@ impl Metrics {
             rebuild_quarantine,
             rebuild_latency,
             rebuild_quarantine_duration,
+            parser_duration,
+            bulk_latency,
         })
     }
 
@@ -1039,9 +1069,33 @@ impl Metrics {
             .observe(seconds);
     }
 
-    pub fn observe_quarantine_duration(&self, phase: &str, lexicon: &str, reason: &str, seconds: f64) {
+    pub fn observe_quarantine_duration(
+        &self,
+        phase: &str,
+        lexicon: &str,
+        reason: &str,
+        seconds: f64,
+    ) {
         self.rebuild_quarantine_duration
             .with_label_values(&[phase, lexicon, reason])
+            .observe(seconds);
+    }
+
+    pub fn observe_parser_duration(&self, phase: &str, lexicon: &str, seconds: f64) {
+        self.parser_duration
+            .with_label_values(&[phase, lexicon])
+            .observe(seconds);
+    }
+
+    pub fn observe_bulk_latency(
+        &self,
+        phase: &str,
+        lexicon: &str,
+        outcome: RebuildOutcomeMetric,
+        seconds: f64,
+    ) {
+        self.bulk_latency
+            .with_label_values(&[phase, lexicon, outcome.as_label()])
             .observe(seconds);
     }
 
@@ -1729,6 +1783,7 @@ mod tests {
             request_timeout_secs: 1,
             max_retries: 1,
             retry_backoff_secs: 1,
+            bulk_batch_size: 5_000,
         };
         ElasticsearchBackend::new(config).expect("backend")
     }
