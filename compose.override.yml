@@ -1,5 +1,3 @@
-version: '3'
-
 services:
   kosh-rust: {
     ## Uncomment the next line to configure kosh through a configuration file.
