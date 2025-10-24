@@ -56,7 +56,7 @@ impl Default for DataConfig {
             wait: 60,
             retry_backoff_secs: 5,
             bulk_batch_size: 5_000,
-            streaming_parser: false,
+            streaming_parser: true,
             parse_concurrency: None,
         }
     }
@@ -508,7 +508,7 @@ mod tests {
         assert_eq!(config.data.retry_backoff_secs, 5);
         assert_eq!(config.data.bulk_batch_size, 5_000);
         assert!(config.data.parse_concurrency.is_none());
-        assert!(!config.data.streaming_parser);
+        assert!(config.data.streaming_parser);
         assert_eq!(config.logger.format, LogFormat::Text);
     }
 
@@ -530,7 +530,7 @@ mod tests {
         assert_eq!(config.data.retry_backoff_secs, 5);
         assert_eq!(config.data.bulk_batch_size, 5_000);
         assert!(config.data.parse_concurrency.is_none());
-        assert!(!config.data.streaming_parser);
+        assert!(config.data.streaming_parser);
     }
 
     #[test]
