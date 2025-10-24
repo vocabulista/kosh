@@ -23,9 +23,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for lex in lexica {
         let lex = Arc::new(lex);
         let dom_parser =
-            XmlEntryParser::new(Arc::clone(&lex), namespaces.clone(), ParserMode::Dom)?;
-        let streaming_parser =
-            XmlEntryParser::new(Arc::clone(&lex), namespaces.clone(), ParserMode::Streaming)?;
+            XmlEntryParser::new(Arc::clone(&lex), namespaces.clone(), ParserMode::Dom, 1)?;
+        let streaming_parser = XmlEntryParser::new(
+            Arc::clone(&lex),
+            namespaces.clone(),
+            ParserMode::Streaming,
+            1,
+        )?;
 
         if !streaming_parser.supports_streaming() {
             continue;

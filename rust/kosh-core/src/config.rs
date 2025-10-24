@@ -41,6 +41,7 @@ pub struct DataConfig {
     pub retry_backoff_secs: u32,
     pub bulk_batch_size: u32,
     pub streaming_parser: bool,
+    pub parse_concurrency: Option<u32>,
 }
 
 impl Default for DataConfig {
@@ -56,6 +57,7 @@ impl Default for DataConfig {
             retry_backoff_secs: 5,
             bulk_batch_size: 5_000,
             streaming_parser: false,
+            parse_concurrency: None,
         }
     }
 }
@@ -279,6 +281,20 @@ impl KoshConfig {
         {
             self.data.streaming_parser = parse_bool("data.streaming_parser", streaming)?;
         }
+        if let Some(concurrency) = ini_value(map, "data", "parse_concurrency")
+            .or_else(|| ini_value(map, "data", "parse-concurrency"))
+        {
+            if concurrency.eq_ignore_ascii_case("auto") {
+                self.data.parse_concurrency = None;
+            } else {
+                let parsed = parse_u32("data.parse_concurrency", concurrency)?;
+                if parsed == 0 {
+                    self.data.parse_concurrency = None;
+                } else {
+                    self.data.parse_concurrency = Some(parsed.max(1));
+                }
+            }
+        }
 
         if let Some(desc) = ini_value(map, "info", "desc") {
             self.info.desc = desc.to_owned();
@@ -491,6 +507,7 @@ mod tests {
         assert_eq!(config.data.root, PathBuf::from("/var/lib/kosh"));
         assert_eq!(config.data.retry_backoff_secs, 5);
         assert_eq!(config.data.bulk_batch_size, 5_000);
+        assert!(config.data.parse_concurrency.is_none());
         assert!(!config.data.streaming_parser);
         assert_eq!(config.logger.format, LogFormat::Text);
     }
@@ -512,6 +529,7 @@ mod tests {
         assert_eq!(config.data.pool, "custom");
         assert_eq!(config.data.retry_backoff_secs, 5);
         assert_eq!(config.data.bulk_batch_size, 5_000);
+        assert!(config.data.parse_concurrency.is_none());
         assert!(!config.data.streaming_parser);
     }
 
@@ -546,6 +564,26 @@ mod tests {
         let config = KoshConfig::from_optional_file(Some(file.path())).expect("load config");
 
         assert_eq!(config.data.bulk_batch_size, 1_234);
+    }
+
+    #[test]
+    fn parse_concurrency_override_is_applied() {
+        let mut file = NamedTempFile::new().expect("temp file");
+        writeln!(file, "[data]\nparse_concurrency = 8\n").expect("write config");
+
+        let config = KoshConfig::from_optional_file(Some(file.path())).expect("load config");
+
+        assert_eq!(config.data.parse_concurrency, Some(8));
+    }
+
+    #[test]
+    fn parse_concurrency_auto_is_supported() {
+        let mut file = NamedTempFile::new().expect("temp file");
+        writeln!(file, "[data]\nparse_concurrency = auto\n").expect("write config");
+
+        let config = KoshConfig::from_optional_file(Some(file.path())).expect("load config");
+
+        assert!(config.data.parse_concurrency.is_none());
     }
 
     #[test]

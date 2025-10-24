@@ -26,6 +26,8 @@ without hunting across repos.
 - Useful toggles:
   - `--data-bulk-batch-size <n>` / `KOSH_DATA_BULK_BATCH_SIZE=<n>` (defaults to `5000`)
   - `--data-streaming-parser` / `KOSH_DATA_STREAMING_PARSER=true` to enable the streaming XML parser.
+  - `--data-parse-concurrency <n>` / `KOSH_DATA_PARSE_CONCURRENCY=<n>` to pin parser workers; omit
+    to let kosh auto-detect (`cpu_limit - 1`, capped at 12).
   - `--dump-artifacts <dir>` to write OpenAPI + GraphQL bundles and exit.
 
 ## Streaming Parser

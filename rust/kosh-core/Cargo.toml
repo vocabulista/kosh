@@ -24,6 +24,7 @@ reqwest = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
 quick-xml = "0.31"
+crossbeam-channel = "0.5"
 
 [dev-dependencies]
 tempfile = "3"

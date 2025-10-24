@@ -1,7 +1,8 @@
 # Parallel Ingestion Plan
 
-The streaming parser has reduced parse latency for simple XPaths. The next step is to evaluate
-parallelising file ingestion so multi-file lexica index faster without starving Elasticsearch.
+The streaming parser has reduced parse latency for simple XPaths. We now extend that work by
+parallelising entry parsing so multi-file lexica index faster without starving Elasticsearch or
+breaking deterministic behaviour.
 
 ## Objectives
 
@@ -20,15 +21,32 @@ parallelising file ingestion so multi-file lexica index faster without starving 
 2. Move the parity harness to a larger multi-file lexicon (e.g., `de_alcedo`) and measure end-to-end
    rebuild time.
 
-3. Prototype a bounded worker pool in a feature branch:
-   - Use `tokio::task::spawn_blocking` or rayon for parsing while keeping bulk uploads sequential.
-   - Guard pool size with a config knob (`KOSH_DATA_PARSE_CONCURRENCY`).
-   - Ensure back pressure: bulk indexing must not start until all documents from the previous batch are completed.
+3. Run the bounded worker pool that ships in Rust (`XmlEntryParser` now fan-outs entries via
+   `crossbeam-channel` workers):
+   - Configure pool size with `KOSH_DATA_PARSE_CONCURRENCY` or `--data-parse-concurrency` (leave
+     it unset to let kosh pick `max(1, cpu_limit - 1)` automatically, capped at 12).
+   - Verify that the coordinator drains results in lexical order before forwarding batches to
+     Elasticsearch (sequential `IndexService::bulk_in_chunks`).
+   - Confirm complex XPath roots (predicates, namespace qualifiers) still stream correctly—the
+     matcher now sanitises predicates before descent.
 
 4. Re-run parity tests (`cargo run --example streaming_parity -- /path/to/kosh_data`) to confirm behaviour
    matches the DOM parser.
 
-5. Stress-test Elasticsearch under concurrent parsing to ensure CPU/IO utilisation stays within acceptable bounds.
+5. Stress-test Elasticsearch under concurrent parsing to ensure CPU/IO utilisation stays within
+   acceptable bounds and that the worker pool respects container CPU limits.
+
+## Implementation Highlights
+
+- Entry concurrency happens inside `XmlEntryParser::parse_file_streaming`: streaming events are
+  serialised into entry blobs, then processed on a bounded pool of blocking worker threads.
+- Each worker instantiates its own XPath evaluator, keeping `sxd_xpath`'s `Rc`-backed handles
+  thread-confined while still benefiting from cached namespace metadata.
+- Ordering is preserved by collecting worker results into indexed slots before handing them to
+  `IndexService`, so downstream bulk requests remain deterministic.
+- When a root XPath cannot be safely simplified (wildcards, attribute axes), the code still falls
+  back to the DOM parser. For supported predicates, the streaming parser now strips the predicate
+  portion to match the structural element while the worker re-evaluates the full XPath on the entry.
 
 ## Decision Gates
 

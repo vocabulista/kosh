@@ -22,6 +22,7 @@ use notify::{
     event::{EventKind, ModifyKind, RenameMode},
     Event, RecommendedWatcher, RecursiveMode, Watcher,
 };
+use num_cpus;
 use thiserror::Error;
 use tokio::{
     signal,
@@ -73,6 +74,14 @@ struct Cli {
     /// Override filesystem sync interval.
     #[arg(long = "data-sync", alias = "data_sync", value_name = "SECONDS")]
     data_sync: Option<u32>,
+
+    /// Override the maximum number of XML parser workers.
+    #[arg(
+        long = "data-parse-concurrency",
+        alias = "data_parse_concurrency",
+        value_name = "COUNT"
+    )]
+    data_parse_concurrency: Option<u32>,
 
     /// Override bulk indexing batch size.
     #[arg(
@@ -138,6 +147,77 @@ fn env_var(name: &str) -> Result<Option<String>, CliError> {
             message: format!("environment variable {name} contains invalid unicode"),
         }),
     }
+}
+
+fn detect_cgroup_cpu_limit() -> Option<usize> {
+    if let Ok(raw) = fs::read_to_string("/sys/fs/cgroup/cpu.max") {
+        let mut parts = raw.split_whitespace();
+        if let (Some(quota), Some(period)) = (parts.next(), parts.next()) {
+            if quota != "max" {
+                if let (Ok(quota), Ok(period)) = (quota.parse::<u64>(), period.parse::<u64>()) {
+                    if let Some(cores) = compute_core_quota(quota, period) {
+                        return Some(cores);
+                    }
+                }
+            }
+        }
+    }
+
+    let quota_path = "/sys/fs/cgroup/cpu/cpu.cfs_quota_us";
+    let period_path = "/sys/fs/cgroup/cpu/cpu.cfs_period_us";
+    if let (Ok(quota_raw), Ok(period_raw)) = (
+        fs::read_to_string(quota_path),
+        fs::read_to_string(period_path),
+    ) {
+        if let (Ok(quota), Ok(period)) = (
+            quota_raw.trim().parse::<i64>(),
+            period_raw.trim().parse::<i64>(),
+        ) {
+            if quota > 0 && period > 0 {
+                if let Some(cores) = compute_core_quota(quota as u64, period as u64) {
+                    return Some(cores);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn compute_core_quota(quota: u64, period: u64) -> Option<usize> {
+    if period == 0 {
+        return None;
+    }
+    let mut cores = quota / period;
+    if quota % period != 0 {
+        cores += 1;
+    }
+    Some(cores.max(1) as usize)
+}
+
+fn auto_parse_concurrency() -> usize {
+    const AUTO_PARSE_MAX: usize = 12;
+    let physical = num_cpus::get().max(1);
+    let detected = detect_cgroup_cpu_limit().unwrap_or(physical);
+    let capped = detected.min(physical);
+
+    let mut usable = capped;
+    if usable > 1 {
+        usable -= 1;
+    }
+    if usable == 0 {
+        usable = 1;
+    }
+
+    usable.min(AUTO_PARSE_MAX)
+}
+
+fn effective_parse_concurrency(config: &KoshConfig) -> usize {
+    config
+        .data
+        .parse_concurrency
+        .map(|value| value.max(1) as usize)
+        .unwrap_or_else(auto_parse_concurrency)
 }
 
 fn apply_env_overrides(config: &mut KoshConfig) -> Result<(), CliError> {
@@ -221,6 +301,22 @@ fn apply_env_overrides(config: &mut KoshConfig) -> Result<(), CliError> {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
             config.data.bulk_batch_size = parse_env_value("KOSH_DATA_BULK_BATCH_SIZE", trimmed)?;
+        }
+    }
+
+    if let Some(value) = env_var("KOSH_DATA_PARSE_CONCURRENCY")? {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            if trimmed.eq_ignore_ascii_case("auto") {
+                config.data.parse_concurrency = None;
+            } else {
+                let parsed: u32 = parse_env_value("KOSH_DATA_PARSE_CONCURRENCY", trimmed)?;
+                if parsed == 0 {
+                    config.data.parse_concurrency = None;
+                } else {
+                    config.data.parse_concurrency = Some(parsed.max(1));
+                }
+            }
         }
     }
 
@@ -764,6 +860,10 @@ async fn run() -> Result<(), CliError> {
         config.data.sync = sync;
     }
 
+    if let Some(concurrency) = cli.data_parse_concurrency {
+        config.data.parse_concurrency = Some(concurrency.max(1));
+    }
+
     if let Some(batch) = cli.data_bulk_batch_size {
         config.data.bulk_batch_size = batch.max(1);
     }
@@ -824,6 +924,12 @@ async fn run() -> Result<(), CliError> {
     } else {
         ParserMode::Dom
     };
+    let parse_concurrency = effective_parse_concurrency(&config);
+    info!(
+        parse_concurrency,
+        auto = config.data.parse_concurrency.is_none(),
+        "resolved parser concurrency"
+    );
 
     let shared_lexica: Vec<_> = lexica.into_iter().map(Arc::new).collect();
     let registry = Arc::new(RwLock::new(LexiconRegistry::new(
@@ -874,6 +980,7 @@ async fn run() -> Result<(), CliError> {
             "bootstrap",
             false,
             parser_mode,
+            parse_concurrency,
         )));
     }
 
@@ -901,6 +1008,7 @@ async fn run() -> Result<(), CliError> {
                 watch_registry,
                 watch_budget,
                 parser_mode,
+                parse_concurrency,
             )
             .await
             {
@@ -1014,6 +1122,7 @@ async fn apply_incremental_updates(
     registry: Arc<RwLock<LexiconRegistry>>,
     budget: Arc<RwLock<FailureBudget>>,
     parser_mode: ParserMode,
+    parse_concurrency: usize,
     changes: Vec<PathChange>,
 ) -> Result<(), WatchError> {
     if changes.is_empty() {
@@ -1062,6 +1171,7 @@ async fn apply_incremental_updates(
             "watcher",
             true,
             parser_mode,
+            parse_concurrency,
         )
         .await;
     }
@@ -1090,18 +1200,24 @@ async fn rebuild_lexicon(
     service: IndexService<ElasticsearchBackend>,
     phase: &'static str,
     parser_mode: ParserMode,
+    parse_concurrency: usize,
 ) -> Result<RebuildOutcome, IndexError> {
     debug!(phase, lexicon = %lexicon.uid, "rebuild task started");
-
     let (documents, parse_seconds) = {
         let parser = match XmlEntryParser::new(
             Arc::clone(&lexicon),
             namespaces.as_ref().clone(),
             parser_mode,
+            parse_concurrency,
         ) {
             Ok(parser) => parser,
             Err(err) => {
-                warn!(phase, lexicon = %lexicon.uid, error = %err, "failed to prepare XML parser");
+                warn!(
+                    phase,
+                    lexicon = %lexicon.uid,
+                    error = %err,
+                    "failed to prepare XML parser"
+                );
                 return Err(IndexError::backend(err.to_string()));
             }
         };
@@ -1124,12 +1240,7 @@ async fn rebuild_lexicon(
                     documents.append(&mut batch);
 
                     while processed >= next_log {
-                        info!(
-                            phase,
-                            lexicon = %lexicon.uid,
-                            processed,
-                            "rebuild progress"
-                        );
+                        info!(phase, lexicon = %lexicon.uid, processed, "rebuild progress");
                         next_log += 500;
                     }
                 }
@@ -1145,6 +1256,10 @@ async fn rebuild_lexicon(
 
         if documents.is_empty() {
             debug!(phase, lexicon = %lexicon.uid, "no documents produced during rebuild");
+        }
+
+        if processed > 0 && processed % 500 != 0 {
+            info!(phase, lexicon = %lexicon.uid, processed, "rebuild progress");
         }
 
         let parse_seconds = parse_start.elapsed().as_secs_f64();
@@ -1196,6 +1311,7 @@ async fn execute_rebuild(
     phase: &'static str,
     respect_quarantine: bool,
     parser_mode: ParserMode,
+    parse_concurrency: usize,
 ) {
     let uid = lexicon.uid.clone();
 
@@ -1221,6 +1337,7 @@ async fn execute_rebuild(
         service.clone(),
         phase,
         parser_mode,
+        parse_concurrency,
     )
     .await;
     let elapsed = start.elapsed();
@@ -1312,6 +1429,7 @@ async fn rescan_lexica(
     registry: Arc<RwLock<LexiconRegistry>>,
     budget: Arc<RwLock<FailureBudget>>,
     parser_mode: ParserMode,
+    parse_concurrency: usize,
 ) -> Result<(), WatchError> {
     let lexica = discover_lexica(&config.data.root, &config.data.spec, &config.data.pool)
         .map_err(WatchError::Lexicon)?;
@@ -1351,6 +1469,7 @@ async fn rescan_lexica(
             "watcher",
             true,
             parser_mode,
+            parse_concurrency,
         )
         .await;
     }
@@ -1366,6 +1485,7 @@ async fn watch_lexica(
     registry: Arc<RwLock<LexiconRegistry>>,
     budget: Arc<RwLock<FailureBudget>>,
     parser_mode: ParserMode,
+    parse_concurrency: usize,
 ) -> Result<(), WatchError> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
 
@@ -1408,6 +1528,7 @@ async fn watch_lexica(
                 Arc::clone(&registry),
                 Arc::clone(&budget),
                 parser_mode,
+                parse_concurrency,
             )
             .await
             {
@@ -1432,6 +1553,7 @@ async fn watch_lexica(
             Arc::clone(&registry),
             Arc::clone(&budget),
             parser_mode,
+            parse_concurrency,
             changes,
         )
         .await
@@ -1456,9 +1578,9 @@ fn normalise_endpoint(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_env_overrides, apply_incremental_updates, normalise_endpoint,
-        path_changes_from_event, rescan_lexica, ChangeKind, FailureBudget, LexiconRegistry,
-        LogFormat, ParserMode, PathChange,
+        apply_env_overrides, apply_incremental_updates, effective_parse_concurrency,
+        normalise_endpoint, path_changes_from_event, rescan_lexica, ChangeKind, FailureBudget,
+        LexiconRegistry, LogFormat, ParserMode, PathChange,
     };
     use httpmock::MockServer;
     use kosh_api::{AppState, Metrics};
@@ -1525,6 +1647,7 @@ mod tests {
         let _log_file = EnvGuard::set("KOSH_LOG_FILE", "/tmp/kosh.log");
         let _log_format = EnvGuard::set("KOSH_LOG_FORMAT", "json");
         let _data_sync = EnvGuard::set("KOSH_DATA_SYNC", "15");
+        let _parse_concurrency = EnvGuard::set("KOSH_DATA_PARSE_CONCURRENCY", "4");
         let _api_port = EnvGuard::set("KOSH_API_PORT", "7001");
 
         let mut config = KoshConfig::default();
@@ -1534,6 +1657,7 @@ mod tests {
         assert_eq!(config.logger.file, Some(PathBuf::from("/tmp/kosh.log")));
         assert_eq!(config.logger.format, LogFormat::Json);
         assert_eq!(config.data.sync, 15);
+        assert_eq!(config.data.parse_concurrency, Some(4));
         assert_eq!(config.api.port, 7001);
     }
 
@@ -1671,6 +1795,8 @@ mod tests {
             Arc::clone(&metrics),
         ));
 
+        let test_concurrency = effective_parse_concurrency(&config);
+
         rescan_lexica(
             Arc::clone(&config),
             Arc::clone(&state),
@@ -1679,6 +1805,7 @@ mod tests {
             Arc::clone(&registry),
             Arc::clone(&budget),
             ParserMode::Dom,
+            test_concurrency,
         )
         .await
         .expect("initial rescan");
@@ -1704,6 +1831,7 @@ mod tests {
             Arc::clone(&registry),
             Arc::clone(&budget),
             ParserMode::Dom,
+            test_concurrency,
             changes,
         )
         .await

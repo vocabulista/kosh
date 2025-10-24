@@ -13,6 +13,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 notify = { workspace = true }
+num_cpus = "1"
 clap_mangen = "0.2"
 
 [dev-dependencies]

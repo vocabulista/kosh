@@ -4,8 +4,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::thread;
 
 use chrono::Utc;
+use crossbeam_channel::{bounded, unbounded};
 use quick_xml::{events::Event, Reader, Writer};
 use serde_json::{Map, Value as JsonValue};
 use sha1::{Digest, Sha1};
@@ -141,6 +143,7 @@ pub struct XmlEntryParser {
     id_expr: XPath,
     field_exprs: HashMap<String, XPath>,
     streaming_segments: Option<Vec<StreamSegment>>,
+    parse_concurrency: usize,
 }
 
 impl XmlEntryParser {
@@ -149,7 +152,9 @@ impl XmlEntryParser {
         lexicon: Arc<LexiconDescriptor>,
         namespaces: HashMap<String, String>,
         mode: ParserMode,
+        parse_concurrency: usize,
     ) -> Result<Self, ParserError> {
+        let parse_concurrency = parse_concurrency.max(1);
         let xpaths = LexiconXpaths::from_schema(&lexicon.schema)?;
         let factory = XPathFactory::new();
         let root_expr = compile_xpath(&factory, &xpaths.root)?;
@@ -184,6 +189,7 @@ impl XmlEntryParser {
             id_expr,
             field_exprs,
             streaming_segments,
+            parse_concurrency,
         })
     }
 
@@ -292,7 +298,7 @@ impl XmlEntryParser {
         reader.trim_text(true);
         let mut buf = Vec::new();
 
-        let mut documents = Vec::new();
+        let mut entry_blobs: Vec<Vec<u8>> = Vec::new();
         let mut match_stack: Vec<bool> = Vec::new();
         let mut collecting = false;
         let mut entry_depth = 0usize;
@@ -387,14 +393,16 @@ impl XmlEntryParser {
                                     path: path.to_path_buf(),
                                     reason: err.to_string(),
                                 })?;
-                            finalize_entry(
-                                self,
-                                new_writer.into_inner(),
-                                &mut documents,
-                                &created,
-                                path,
-                                &mut processed,
-                            )?;
+                            entry_blobs.push(new_writer.into_inner());
+                            processed += 1;
+                            if processed % 500 == 0 {
+                                info!(
+                                    lexicon = %self.lexicon.uid,
+                                    file = %path.display(),
+                                    processed,
+                                    "parsed lexicon records"
+                                );
+                            }
                         }
                         continue;
                     }
@@ -423,14 +431,16 @@ impl XmlEntryParser {
                                 path: path.to_path_buf(),
                                 reason: err.to_string(),
                             })?;
-                        finalize_entry(
-                            self,
-                            new_writer.into_inner(),
-                            &mut documents,
-                            &created,
-                            path,
-                            &mut processed,
-                        )?;
+                        entry_blobs.push(new_writer.into_inner());
+                        processed += 1;
+                        if processed % 500 == 0 {
+                            info!(
+                                lexicon = %self.lexicon.uid,
+                                file = %path.display(),
+                                processed,
+                                "parsed lexicon records"
+                            );
+                        }
                     }
 
                     match_stack.pop();
@@ -528,14 +538,16 @@ impl XmlEntryParser {
                                     .expect("streaming writer must exist")
                                     .into_inner();
                                 collecting = false;
-                                finalize_entry(
-                                    self,
-                                    entry_bytes,
-                                    &mut documents,
-                                    &created,
-                                    path,
-                                    &mut processed,
-                                )?;
+                                entry_blobs.push(entry_bytes);
+                                processed += 1;
+                                if processed % 500 == 0 {
+                                    info!(
+                                        lexicon = %self.lexicon.uid,
+                                        file = %path.display(),
+                                        processed,
+                                        "parsed lexicon records"
+                                    );
+                                }
                             } else if entry_depth > 0 {
                                 entry_depth -= 1;
                             }
@@ -564,14 +576,16 @@ impl XmlEntryParser {
                                 .expect("streaming writer must exist")
                                 .into_inner();
                             collecting = false;
-                            finalize_entry(
-                                self,
-                                entry_bytes,
-                                &mut documents,
-                                &created,
-                                path,
-                                &mut processed,
-                            )?;
+                            entry_blobs.push(entry_bytes);
+                            processed += 1;
+                            if processed % 500 == 0 {
+                                info!(
+                                    lexicon = %self.lexicon.uid,
+                                    file = %path.display(),
+                                    processed,
+                                    "parsed lexicon records"
+                                );
+                            }
                         } else if entry_depth > 0 {
                             entry_depth -= 1;
                         }
@@ -598,7 +612,171 @@ impl XmlEntryParser {
             );
         }
 
-        Ok(documents)
+        self.build_documents_from_entry_blobs(entry_blobs, &created, path)
+    }
+
+    fn build_documents_from_entry_blobs(
+        &self,
+        entry_blobs: Vec<Vec<u8>>,
+        created: &str,
+        path: &Path,
+    ) -> Result<Vec<IndexDocument>, ParserError> {
+        if entry_blobs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if self.parse_concurrency <= 1 || entry_blobs.len() == 1 {
+            let mut documents = Vec::with_capacity(entry_blobs.len());
+            for entry in entry_blobs {
+                let document = self.entry_bytes_to_document(entry, created, path)?;
+                documents.push(document);
+            }
+            return Ok(documents);
+        }
+
+        self.build_documents_in_parallel(entry_blobs, created, path)
+    }
+
+    fn build_documents_in_parallel(
+        &self,
+        entry_blobs: Vec<Vec<u8>>,
+        created: &str,
+        path: &Path,
+    ) -> Result<Vec<IndexDocument>, ParserError> {
+        let total = entry_blobs.len();
+        let worker_count = self.parse_concurrency.min(total).max(1);
+        let (job_tx, job_rx) = bounded::<(usize, Vec<u8>)>(worker_count * 2);
+        let (result_tx, result_rx) = unbounded::<Result<(usize, IndexDocument), ParserError>>();
+
+        let created_owned = created.to_string();
+        let path_buf = path.to_path_buf();
+        let lexicon = Arc::clone(&self.lexicon);
+        let namespaces = self.namespaces.clone();
+
+        let result = thread::scope(|scope| -> Result<Vec<IndexDocument>, ParserError> {
+            for _ in 0..worker_count {
+                let job_rx = job_rx.clone();
+                let result_tx = result_tx.clone();
+                let lexicon = Arc::clone(&lexicon);
+                let namespaces = namespaces.clone();
+                let created_ref = created_owned.as_str();
+                let path_ref = path_buf.as_path();
+                scope.spawn(move || {
+                    let worker_parser =
+                        match XmlEntryParser::new(lexicon, namespaces, ParserMode::Dom, 1) {
+                            Ok(parser) => parser,
+                            Err(err) => {
+                                let _ = result_tx.send(Err(err));
+                                return;
+                            }
+                        };
+
+                    for (index, entry_bytes) in job_rx.iter() {
+                        let outcome = worker_parser
+                            .entry_bytes_to_document(entry_bytes, created_ref, path_ref)
+                            .map(|doc| (index, doc));
+                        if result_tx.send(outcome).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            drop(result_tx);
+
+            for (index, entry_bytes) in entry_blobs.into_iter().enumerate() {
+                job_tx
+                    .send((index, entry_bytes))
+                    .map_err(|_| ParserError::Stream {
+                        path: path_buf.clone(),
+                        reason: "failed to dispatch stream entry to parser workers".into(),
+                    })?;
+            }
+            drop(job_tx);
+
+            let mut ordered: Vec<Option<IndexDocument>> = vec![None; total];
+            let mut remaining = total;
+            let mut error: Option<ParserError> = None;
+
+            while remaining > 0 {
+                match result_rx.recv() {
+                    Ok(Ok((index, document))) => {
+                        if index >= ordered.len() {
+                            error = Some(ParserError::Stream {
+                                path: path_buf.clone(),
+                                reason: format!("worker returned invalid index {index}"),
+                            });
+                            break;
+                        }
+                        if ordered[index].is_some() {
+                            error = Some(ParserError::Stream {
+                                path: path_buf.clone(),
+                                reason: format!("duplicate result for entry index {index}"),
+                            });
+                            break;
+                        }
+                        ordered[index] = Some(document);
+                        remaining -= 1;
+                    }
+                    Ok(Err(err)) => {
+                        error = Some(err);
+                        break;
+                    }
+                    Err(_) => {
+                        error = Some(ParserError::Stream {
+                            path: path_buf.clone(),
+                            reason: "parse workers terminated unexpectedly".into(),
+                        });
+                        break;
+                    }
+                }
+            }
+
+            if let Some(err) = error {
+                Err(err)
+            } else {
+                let mut documents = Vec::with_capacity(ordered.len());
+                for maybe_document in ordered {
+                    if let Some(document) = maybe_document {
+                        documents.push(document);
+                    } else {
+                        return Err(ParserError::Stream {
+                            path: path_buf.clone(),
+                            reason: "missing document after parallel parsing".into(),
+                        });
+                    }
+                }
+                Ok(documents)
+            }
+        });
+
+        result
+    }
+
+    fn entry_bytes_to_document(
+        &self,
+        entry_bytes: Vec<u8>,
+        created: &str,
+        path: &Path,
+    ) -> Result<IndexDocument, ParserError> {
+        let entry_xml = String::from_utf8(entry_bytes)
+            .map_err(|err| ParserError::Serialize(err.to_string()))?;
+        let package =
+            sxd_parser::parse(&entry_xml).map_err(|source| ParserError::MalformedXml {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let document = package.as_document();
+        let mut entry_node = None;
+        for child in document.root().children() {
+            if let ChildOfRoot::Element(element) = child {
+                entry_node = Some(Node::Element(element));
+                break;
+            }
+        }
+        let entry_node = entry_node.ok_or(ParserError::UnsupportedNode)?;
+        let context = self.build_context();
+        self.build_document(&context, entry_node, created)
     }
 
     fn build_context(&self) -> XPathContext<'_> {
@@ -656,44 +834,6 @@ impl XmlEntryParser {
     }
 }
 
-fn finalize_entry(
-    parser: &XmlEntryParser,
-    entry_bytes: Vec<u8>,
-    documents: &mut Vec<IndexDocument>,
-    created: &str,
-    path: &Path,
-    processed: &mut usize,
-) -> Result<(), ParserError> {
-    let entry_xml =
-        String::from_utf8(entry_bytes).map_err(|err| ParserError::Serialize(err.to_string()))?;
-    let package = sxd_parser::parse(&entry_xml).map_err(|source| ParserError::MalformedXml {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let document = package.as_document();
-    let mut entry_node = None;
-    for child in document.root().children() {
-        if let ChildOfRoot::Element(element) = child {
-            entry_node = Some(Node::Element(element));
-            break;
-        }
-    }
-    let entry_node = entry_node.ok_or(ParserError::UnsupportedNode)?;
-    let context = parser.build_context();
-    let document = parser.build_document(&context, entry_node, created)?;
-    documents.push(document);
-    *processed += 1;
-    if *processed % 500 == 0 {
-        info!(
-            lexicon = %parser.lexicon.uid,
-            file = %path.display(),
-            processed = *processed,
-            "parsed lexicon records"
-        );
-    }
-    Ok(())
-}
-
 fn matches_segment(segment: &StreamSegment, name: &[u8]) -> bool {
     if let Ok(raw) = std::str::from_utf8(name) {
         if let Some((prefix, local)) = raw.split_once(':') {
@@ -730,13 +870,7 @@ fn parse_stream_segments(root: &str) -> Option<Vec<StreamSegment>> {
     if !simplified.starts_with('/') {
         return None;
     }
-    if simplified.contains('[')
-        || simplified.contains('@')
-        || simplified.contains('(')
-        || simplified.contains(')')
-        || simplified.contains('|')
-        || simplified.contains('*')
-    {
+    if simplified.contains('@') || simplified.contains('|') || simplified.contains('*') {
         return None;
     }
 
@@ -750,7 +884,22 @@ fn parse_stream_segments(root: &str) -> Option<Vec<StreamSegment>> {
 
     let mut segments = Vec::with_capacity(parts.len());
     for part in parts {
-        if let Some((prefix, local)) = part.split_once(':') {
+        let core = part
+            .split_once('[')
+            .map(|(name, _)| name)
+            .unwrap_or(part)
+            .trim();
+        if core.is_empty()
+            || core.contains('@')
+            || core.contains('(')
+            || core.contains(')')
+            || core.contains('|')
+            || core.contains('*')
+        {
+            return None;
+        }
+
+        if let Some((prefix, local)) = core.split_once(':') {
             if prefix.is_empty() || local.is_empty() {
                 return None;
             }
@@ -761,7 +910,7 @@ fn parse_stream_segments(root: &str) -> Option<Vec<StreamSegment>> {
         } else {
             segments.push(StreamSegment {
                 prefix: None,
-                local: part.to_string(),
+                local: core.to_string(),
             });
         }
     }
@@ -963,8 +1112,8 @@ mod tests {
         )
         .expect("write xml");
 
-        let parser =
-            XmlEntryParser::new(sample_lexicon(), HashMap::new(), ParserMode::Dom).expect("parser");
+        let parser = XmlEntryParser::new(sample_lexicon(), HashMap::new(), ParserMode::Dom, 1)
+            .expect("parser");
         let docs = parser.parse_file(temp.path()).expect("parse file");
 
         assert_eq!(docs.len(), 2);
@@ -1025,10 +1174,10 @@ mod tests {
         )
         .expect("write xml");
 
-        let dom_parser = XmlEntryParser::new(sample_lexicon(), HashMap::new(), ParserMode::Dom)
+        let dom_parser = XmlEntryParser::new(sample_lexicon(), HashMap::new(), ParserMode::Dom, 1)
             .expect("dom parser");
         let streaming_parser =
-            XmlEntryParser::new(sample_lexicon(), HashMap::new(), ParserMode::Streaming)
+            XmlEntryParser::new(sample_lexicon(), HashMap::new(), ParserMode::Streaming, 1)
                 .expect("streaming parser");
 
         let dom_docs = dom_parser.parse_file(temp.path()).expect("dom parse");
@@ -1059,10 +1208,12 @@ mod tests {
         .expect("write xml");
 
         let lexicon = lexicon_with_root("//item");
-        let dom_parser = XmlEntryParser::new(Arc::clone(&lexicon), HashMap::new(), ParserMode::Dom)
-            .expect("dom parser");
-        let streaming_parser = XmlEntryParser::new(lexicon, HashMap::new(), ParserMode::Streaming)
-            .expect("streaming parser");
+        let dom_parser =
+            XmlEntryParser::new(Arc::clone(&lexicon), HashMap::new(), ParserMode::Dom, 1)
+                .expect("dom parser");
+        let streaming_parser =
+            XmlEntryParser::new(lexicon, HashMap::new(), ParserMode::Streaming, 1)
+                .expect("streaming parser");
 
         let dom_docs = dom_parser.parse_file(temp.path()).expect("dom parse");
         let streaming_docs = streaming_parser
