@@ -10,4 +10,5 @@ parity/
 *.md
 !README.md
 !**/README.md
+!docs/parallel-ingestion-plan.md
 !KOSH_RUST_GUIDE.md

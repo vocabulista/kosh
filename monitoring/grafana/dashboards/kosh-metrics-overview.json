@@ -275,8 +275,62 @@
     },
     {
       "type": "graph",
-      "title": "Quarantine Duration p95 (30m)",
+      "title": "Parser Latency p95 (10m)",
       "id": 7,
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(kosh_parser_duration_seconds_bucket[10m]))",
+          "legendFormat": "p95"
+        }
+      ],
+      "lines": true,
+      "linewidth": 2,
+      "nullPointMode": "null",
+      "span": 12,
+      "yaxes": [
+        {
+          "format": "s",
+          "label": "seconds",
+          "logBase": 1,
+          "min": 0
+        },
+        {
+          "format": "short"
+        }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Bulk Latency p95 (10m)",
+      "id": 8,
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(kosh_bulk_latency_seconds_bucket[10m]))",
+          "legendFormat": "p95"
+        }
+      ],
+      "lines": true,
+      "linewidth": 2,
+      "nullPointMode": "null",
+      "span": 12,
+      "yaxes": [
+        {
+          "format": "s",
+          "label": "seconds",
+          "logBase": 1,
+          "min": 0
+        },
+        {
+          "format": "short"
+        }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Quarantine Duration p95 (30m)",
+      "id": 9,
       "datasource": "Prometheus",
       "targets": [
         {

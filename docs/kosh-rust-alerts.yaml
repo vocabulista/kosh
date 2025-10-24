@@ -2,53 +2,81 @@
 # (recording rules can be added to an existing rule file or managed by your IaC tooling).
 
 groups:
-  - name: kosh-rust.alerts
-    rules:
-      - alert: KoshRebuildRetryStorm
-        expr: increase(kosh_rebuild_retries_total[15m]) > 5
-        for: 5m
-        labels:
-          severity: warning
-          service: kosh-rust
-        annotations:
-          summary: "Kosh rebuild retries exceeding threshold"
-          description: >
-            {{ $labels.lexicon }} has recorded {{ $value }} rebuild retries in the last 15 minutes
-            (phase={{ $labels.phase }}, reason={{ $labels.reason }}). Investigate Elasticsearch health,
-            data quality, or watcher configuration before the circuit breaker trips.
+- name: kosh-rust.alerts
+  rules:
+  - alert: KoshRebuildRetryStorm
+    expr: increase(kosh_rebuild_retries_total[15m]) > 5
+    for: 5m
+    labels:
+      severity: warning
+      service: kosh-rust
+    annotations:
+      summary: Kosh rebuild retries exceeding threshold
+      description: '{{ $labels.lexicon }} has recorded {{ $value }} rebuild retries
+        in the last 15 minutes (phase={{ $labels.phase }}, reason={{ $labels.reason
+        }}). Investigate Elasticsearch health, data quality, or watcher configuration
+        before the circuit breaker trips.
 
-      - alert: KoshQuarantineStuck
-        expr: kosh_rebuild_quarantine_active == 1
-        for: 15m
-        labels:
-          severity: critical
-          service: kosh-rust
-        annotations:
-          summary: "Kosh lexicon quarantined for over 15 minutes"
-          description: >
-            Lexicon {{ $labels.lexicon }} has been in quarantine for more than 15 minutes.
-            Check watcher logs for persistent failures or empty datasets.
+        '
+  - alert: KoshQuarantineStuck
+    expr: kosh_rebuild_quarantine_active == 1
+    for: 15m
+    labels:
+      severity: critical
+      service: kosh-rust
+    annotations:
+      summary: Kosh lexicon quarantined for over 15 minutes
+      description: 'Lexicon {{ $labels.lexicon }} has been in quarantine for more
+        than 15 minutes. Check watcher logs for persistent failures or empty datasets.
 
-      - alert: KoshSlowRebuilds
-        expr: histogram_quantile(0.95, rate(kosh_rebuild_latency_seconds_bucket[10m])) > 30
-        for: 10m
-        labels:
-          severity: warning
-          service: kosh-rust
-        annotations:
-          summary: "Kosh rebuild latency p95 above 30 seconds"
-          description: >
-            The 95th percentile rebuild latency is {{ $value | printf \"%.2f\" }}s, exceeding the 30s SLO.
-            Check Elasticsearch performance and lexicon size to avoid falling behind on updates.
+        '
+  - alert: KoshSlowRebuilds
+    expr: histogram_quantile(0.95, rate(kosh_rebuild_latency_seconds_bucket[10m]))
+      > 30
+    for: 10m
+    labels:
+      severity: warning
+      service: kosh-rust
+    annotations:
+      summary: Kosh rebuild latency p95 above 30 seconds
+      description: 'The 95th percentile rebuild latency is {{ $value | printf \"%.2f\"
+        }}s, exceeding the 30s SLO. Check Elasticsearch performance and lexicon size
+        to avoid falling behind on updates.
 
-      - alert: KoshMetricsMissing
-        expr: absent(kosh_http_requests_total)
-        for: 5m
-        labels:
-          severity: critical
-          service: kosh-rust
-        annotations:
-          summary: "Kosh metrics endpoint is not scraping"
-          description: >
-            Prometheus has not scraped kosh_http_requests_total for 5 minutes. Verify the /metrics endpoint,
-            service availability, or Prometheus scrape configuration.
+        '
+  - alert: KoshSlowParser
+    expr: histogram_quantile(0.95, rate(kosh_parser_duration_seconds_bucket[10m]))
+      > 15
+    for: 10m
+    labels:
+      severity: warning
+      service: kosh-rust
+    annotations:
+      summary: Kosh parser latency p95 above 15 seconds
+      description: The 95th percentile XML parsing duration is {{ $value | printf
+        "%.2f" }}s. Streaming parser performance may be regressing; check recent deployments
+        and dataset size.
+  - alert: KoshSlowBulkIngest
+    expr: histogram_quantile(0.95, rate(kosh_bulk_latency_seconds_bucket[10m])) >
+      30
+    for: 10m
+    labels:
+      severity: warning
+      service: kosh-rust
+    annotations:
+      summary: Kosh bulk ingestion p95 above 30 seconds
+      description: The 95th percentile Elasticsearch bulk ingestion latency is {{
+        $value | printf "%.2f" }}s. Investigate Elasticsearch health, batch sizing,
+        or resource pressure before rebuilds fall behind.
+  - alert: KoshMetricsMissing
+    expr: absent(kosh_http_requests_total)
+    for: 5m
+    labels:
+      severity: critical
+      service: kosh-rust
+    annotations:
+      summary: Kosh metrics endpoint is not scraping
+      description: 'Prometheus has not scraped kosh_http_requests_total for 5 minutes.
+        Verify the /metrics endpoint, service availability, or Prometheus scrape configuration.
+
+        '
