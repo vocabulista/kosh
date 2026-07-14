@@ -21,8 +21,8 @@ maintainers = [
 ]
 
 dependencies = [
-  "elasticsearch",
-  "elasticsearch-dsl",
+  "elasticsearch>=8,<9",
+  "elasticsearch-dsl>=8,<9",
   "flask",
   "flask-graphql",
   "flask-swagger-ui",

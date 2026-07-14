@@ -5,7 +5,7 @@ from typing import Any, Dict, List
 
 from flask import Flask, Response, request
 from flask_swagger_ui import get_swaggerui_blueprint
-from pkg_resources import get_distribution
+from importlib.metadata import version
 
 from ..elastic.search import search
 from ..utility.concretemethod import concretemethod
@@ -139,7 +139,7 @@ class restful(_api):
                 "tags": [{"name": self.lexicon.uid}],
                 "info": {
                     "title": instance.config["info"]["desc"],
-                    "version": get_distribution("kosh").version,
+                    "version": version("kosh"),
                 },
                 "definitions": {
                     "Ids": props("ids"),
