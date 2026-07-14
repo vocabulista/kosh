@@ -13,7 +13,6 @@ use async_graphql::{
         Enum, Field as GqlField, FieldFuture, FieldValue, InputValue, Object, Scalar,
         Schema as DynamicSchema, SchemaError, TypeRef,
     },
-    http::GraphiQLSource,
     BatchResponse, Error as GraphQLError, Request as GraphQLRequest, Value as GraphValue,
 };
 use axum::body::Body;
@@ -79,6 +78,7 @@ impl ApiServer {
 
     fn router(&self) -> Router {
         Router::new()
+            .route("/graphiql/assets/:filename", get(graphiql_asset))
             .route("/health", get(healthcheck))
             .route("/api", get(api_root))
             .route("/api/:uid", get(api_lexicon))
@@ -106,6 +106,31 @@ impl ApiServer {
     pub fn api_config(&self) -> &ApiConfig {
         &self.state.config.api
     }
+}
+
+const GRAPHIQL_TEMPLATE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/static/graphiql/index.html"
+));
+const GRAPHIQL_REACT: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/static/graphiql/react.production.min.js"
+));
+const GRAPHIQL_REACT_DOM: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/static/graphiql/react-dom.production.min.js"
+));
+const GRAPHIQL_JS: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/static/graphiql/graphiql.min.js"
+));
+const GRAPHIQL_CSS: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/static/graphiql/graphiql.min.css"
+));
+
+fn render_graphiql_page(endpoint: &str) -> String {
+    GRAPHIQL_TEMPLATE.replace("__GRAPHQL_ENDPOINT__", endpoint)
 }
 
 const INTROSPECTION_QUERY: &str = r#"
@@ -583,9 +608,34 @@ async fn graphql_graphiql(
 
     let root = state.config.api.root.trim_end_matches('/');
     let endpoint = format!("{}/{}/graphql", root, uid);
-    let source = GraphiQLSource::build().endpoint(&endpoint).finish();
+    let source = render_graphiql_page(&endpoint);
     metrics.observe_http("graphql_graphiql", StatusCode::OK);
     Ok(Html(source))
+}
+
+async fn graphiql_asset(Path(filename): Path<String>) -> Response {
+    match filename.as_str() {
+        "react.production.min.js" => {
+            graphiql_asset_response(GRAPHIQL_REACT, "application/javascript")
+        }
+        "react-dom.production.min.js" => {
+            graphiql_asset_response(GRAPHIQL_REACT_DOM, "application/javascript")
+        }
+        "graphiql.min.js" => graphiql_asset_response(GRAPHIQL_JS, "application/javascript"),
+        "graphiql.min.css" => graphiql_asset_response(GRAPHIQL_CSS, "text/css"),
+        _ => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::empty())
+            .expect("valid HTTP response"),
+    }
+}
+
+fn graphiql_asset_response(bytes: &'static [u8], content_type: &'static str) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, HeaderValue::from_static(content_type))
+        .body(Body::from(bytes))
+        .expect("valid HTTP response")
 }
 
 async fn graphql_handler(

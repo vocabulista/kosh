@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="robots" content="noindex">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="origin">
+
+    <title>GraphiQL IDE</title>
+
+    <style>
+      body {
+        height: 100%;
+        margin: 0;
+        width: 100%;
+        overflow: hidden;
+      }
+
+      #graphiql {
+        height: 100vh;
+      }
+    </style>
+    <script src="/graphiql/assets/react.production.min.js"></script>
+    <script src="/graphiql/assets/react-dom.production.min.js"></script>
+    <link rel="icon" href="https://graphql.org/favicon.ico">
+    <link rel="stylesheet" href="/graphiql/assets/graphiql.min.css" />
+  </head>
+
+  <body>
+    <div id="graphiql">Loading...</div>
+    <script src="/graphiql/assets/graphiql.min.js" type="application/javascript"></script>
+    <script>
+      const customFetch = (url, opts = {}) => {
+        return fetch(url, { ...opts, credentials: 'same-origin' });
+      };
+
+      const createUrl = (endpoint, subscription = false) => {
+        const url = new URL(endpoint, window.location.origin);
+        if (subscription) {
+          url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+        }
+        return url.toString();
+      };
+
+      ReactDOM.render(
+        React.createElement(GraphiQL, {
+          fetcher: GraphiQL.createFetcher({
+            url: createUrl('__GRAPHQL_ENDPOINT__'),
+            fetch: customFetch,
+          }),
+          defaultEditorToolsVisibility: true,
+        }),
+        document.getElementById('graphiql')
+      );
+    </script>
+  </body>
+</html>
