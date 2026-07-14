@@ -149,6 +149,52 @@ fn env_var(name: &str) -> Result<Option<String>, CliError> {
     }
 }
 
+fn resolve_config_path(cli: &Cli) -> Result<Option<PathBuf>, CliError> {
+    if let Some(path) = &cli.config {
+        return Ok(Some(path.clone()));
+    }
+
+    if let Some(value) = env_var("KOSH_CONFIG")? {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(PathBuf::from(trimmed)));
+        }
+    }
+
+    for candidate in default_config_candidates() {
+        if candidate.exists() {
+            return Ok(Some(candidate));
+        }
+    }
+
+    Ok(None)
+}
+
+fn default_config_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(cwd) = env::current_dir() {
+        candidates.push(cwd.join("kosh.ini"));
+        if let Some(parent) = cwd.parent() {
+            candidates.push(parent.join("kosh.ini"));
+        }
+    }
+
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("kosh.ini"));
+            if let Some(parent) = dir.parent() {
+                candidates.push(parent.join("kosh.ini"));
+            }
+        }
+    }
+
+    candidates.push(PathBuf::from("/app/kosh.ini"));
+    candidates.push(PathBuf::from("/etc/kosh/kosh.ini"));
+
+    candidates
+}
+
 fn detect_cgroup_cpu_limit() -> Option<usize> {
     if let Ok(raw) = fs::read_to_string("/sys/fs/cgroup/cpu.max") {
         let mut parts = raw.split_whitespace();
@@ -823,8 +869,8 @@ async fn run() -> Result<(), CliError> {
         return Ok(());
     }
 
-    let mut config =
-        KoshConfig::from_optional_file(cli.config.clone()).map_err(CliError::Config)?;
+    let config_path = resolve_config_path(&cli)?;
+    let mut config = KoshConfig::from_optional_file(config_path).map_err(CliError::Config)?;
 
     for entry in &cli.config_text {
         config.merge_inline(entry).map_err(CliError::Config)?;
@@ -1579,9 +1625,10 @@ fn normalise_endpoint(host: &str) -> String {
 mod tests {
     use super::{
         apply_env_overrides, apply_incremental_updates, effective_parse_concurrency,
-        normalise_endpoint, path_changes_from_event, rescan_lexica, ChangeKind, FailureBudget,
-        LexiconRegistry, LogFormat, ParserMode, PathChange,
+        normalise_endpoint, path_changes_from_event, rescan_lexica, resolve_config_path,
+        ChangeKind, Cli, FailureBudget, LexiconRegistry, LogFormat, ParserMode, PathChange,
     };
+    use clap::Parser;
     use httpmock::MockServer;
     use kosh_api::{AppState, Metrics};
     use kosh_core::{
@@ -1591,8 +1638,8 @@ mod tests {
     use notify::event::{DataChange, ModifyKind};
     use notify::{Event, EventKind};
     use std::collections::HashMap;
-    use std::path::PathBuf;
-    use std::{fs, sync::Arc};
+    use std::path::{Path, PathBuf};
+    use std::{env, fs, sync::Arc};
     use tempfile::tempdir;
     use tokio::sync::RwLock;
     use tokio::time::Duration;
@@ -1620,6 +1667,24 @@ mod tests {
         }
     }
 
+    struct DirGuard {
+        original: PathBuf,
+    }
+
+    impl DirGuard {
+        fn change_to(path: &Path) -> Self {
+            let original = env::current_dir().expect("current dir");
+            env::set_current_dir(path).expect("set current dir");
+            Self { original }
+        }
+    }
+
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            env::set_current_dir(&self.original).expect("restore current dir");
+        }
+    }
+
     #[test]
     fn normalise_endpoint_retains_full_urls() {
         let url = "https://search.example.com:9243";
@@ -1639,6 +1704,43 @@ mod tests {
             normalise_endpoint(host),
             "http://elasticsearch.internal:9200"
         );
+    }
+
+    #[test]
+    fn resolve_config_uses_cli_argument() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("custom.ini");
+        fs::write(&path, "[info]\nname = cli\n").expect("write config");
+
+        let cli = Cli::parse_from(["kosh", "--config", path.to_str().expect("utf8 path")]);
+
+        let resolved = resolve_config_path(&cli).expect("resolve config");
+        assert_eq!(resolved, Some(path));
+    }
+
+    #[test]
+    fn resolve_config_uses_env_fallback() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("env.ini");
+        fs::write(&path, "[info]\nname = env\n").expect("write config");
+        let _env = EnvGuard::set("KOSH_CONFIG", path.to_str().expect("utf8 path"));
+
+        let cli = Cli::parse_from(["kosh"]);
+        let resolved = resolve_config_path(&cli).expect("resolve config");
+        assert_eq!(resolved, Some(path));
+    }
+
+    #[test]
+    fn resolve_config_searches_default_locations() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("kosh.ini");
+        fs::write(&path, "[info]\nname = default\n").expect("write config");
+        let _env = EnvGuard::set("KOSH_CONFIG", "");
+        let _cwd = DirGuard::change_to(dir.path());
+
+        let cli = Cli::parse_from(["kosh"]);
+        let resolved = resolve_config_path(&cli).expect("resolve config");
+        assert_eq!(resolved, Some(path));
     }
 
     #[test]

@@ -53,6 +53,10 @@ Key expectations for the default stack:
     --config /etc/kosh/kosh.ini
   ```
 
+- GraphQL explorer: browse any lexicon locally via GraphiQL at
+  `http://localhost:5001/api/<lexicon_uid>/graphql`; the static assets ship with the API container,
+  so the IDE works without external CDN access.
+
 For production deployments you can `docker build -f Dockerfile.rust` and run the resulting image in
 your orchestrator, passing flags such as `--data-host` and `--data-parse-concurrency` directly to the
 `kosh` binary.
@@ -62,6 +66,9 @@ your orchestrator, passing flags such as `--data-host` and `--data-parse-concurr
 Configuration precedence mirrors the legacy Python stack: built-in defaults → optional INI
 (`--config` or `--config-text`) → environment variables (`KOSH_*`) → explicit CLI flags. The sample
 `kosh.ini` documents every knob. Highlights:
+
+- The CLI autoloads `kosh.ini` when present (current directory, `/app/kosh.ini`, or
+  `/etc/kosh/kosh.ini`); override with `--config` or `KOSH_CONFIG` if you need a different file.
 
 - `[api]` – host, port, and root path; defaults to `0.0.0.0:5000` with `/` as the context.
 - `[data]` – Elasticsearch endpoint (`host`), retry policy (`loop`), index namespace (`pool`), XML
