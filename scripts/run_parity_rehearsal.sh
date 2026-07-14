@@ -42,11 +42,11 @@ python scripts/capture_service_artifacts.py \
   --elastic-url "${ELASTIC_URL}" \
   --indices ${INDICES} \
   -- kosh \
-    --data-root "${DATA_ROOT}" \
-    --data-host "${ELASTIC_URL}" \
-    --data-sync 0 \
-    --api-port "${PYTHON_PORT}" \
-    --log-level INFO
+    --data_root "${DATA_ROOT}" \
+    --data_host "${ELASTIC_URL}" \
+    --data_sync 0 \
+    --api_port "${PYTHON_PORT}" \
+    --log_level INFO
 
 echo "[parity] Capturing Rust artefacts..."
 python scripts/capture_service_artifacts.py \

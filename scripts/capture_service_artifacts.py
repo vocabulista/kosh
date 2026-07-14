@@ -144,7 +144,39 @@ def normalise_spec(spec: Dict) -> Dict:
     info = spec.get("info")
     if isinstance(info, dict):
         info["version"] = "normalized"
+    if "host" in spec:
+        spec["host"] = "normalized"
     return spec
+
+
+def normalise_api_root(payload: Dict) -> Dict:
+    about = payload.get("about")
+    if isinstance(about, dict) and "conf" in about:
+        about["conf"] = "normalized"
+    return payload
+
+
+BUILTIN_SCALARS = {"String", "Int", "Float", "Boolean", "ID"}
+
+
+def normalise_introspection(payload: Dict) -> Dict:
+    schema = payload.get("data", {}).get("__schema")
+    if not isinstance(schema, dict):
+        return payload
+    types = [
+        item
+        for item in schema.get("types", [])
+        if not item.get("name", "").startswith("__")
+        and item.get("name") not in BUILTIN_SCALARS
+    ]
+    for item in types:
+        if item.get("fields"):
+            item["fields"].sort(key=lambda field: field.get("name", ""))
+        if item.get("enumValues"):
+            item["enumValues"].sort(key=lambda value: value.get("name", ""))
+    types.sort(key=lambda item: item.get("name", ""))
+    schema["types"] = types
+    return payload
 
 
 def normalise_entries(entries: List[Dict]) -> List[Dict]:
@@ -175,7 +207,7 @@ def capture_artifacts(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     api_resp = requests.get(f"{base_url}/api", timeout=5).json()
-    save_json(output_dir / "api.json", api_resp)
+    save_json(output_dir / "api.json", normalise_api_root(api_resp))
 
     dicts = api_resp.get("dicts", {})
     for uid, metadata in sorted(dicts.items()):
@@ -264,6 +296,9 @@ def capture_artifacts(
             if skip_graphql_introspection:
                 if not introspection_path.exists():
                     raise RuntimeError(f"expected GraphQL introspection artefact at {introspection_path}")
+                with introspection_path.open("r", encoding="utf-8") as handle:
+                    introspection = json.load(handle)
+                save_json(introspection_path, normalise_introspection(introspection))
             else:
                 introspection = requests.post(
                     f"{base_url}/api/{uid}/graphql",
@@ -287,7 +322,7 @@ def capture_artifacts(
                     },
                     timeout=10,
                 ).json()
-                save_json(introspection_path, introspection)
+                save_json(introspection_path, normalise_introspection(introspection))
 
             field_enum = field
             query_enum = query_type

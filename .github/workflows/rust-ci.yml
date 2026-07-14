@@ -63,16 +63,16 @@ jobs:
             --elastic-url http://127.0.0.1:9200 \
             --indices kosh[demo] kosh[demo_alt] \
             -- kosh \
-              --data-root fixtures/demo \
-              --data-host http://127.0.0.1:9200 \
-              --data-sync 0 \
-              --api-port 6100 \
-              --log-level INFO
+              --data_root fixtures/demo \
+              --data_host http://127.0.0.1:9200 \
+              --data_sync 0 \
+              --api_port 6100 \
+              --log_level INFO
 
       - name: Generate Rust artefacts via CLI
         run: |
           KOSH_API_HOST=127.0.0.1 cargo run --quiet --manifest-path rust/Cargo.toml --package kosh-cli -- \
-            --data-root ../fixtures/demo \
+            --data-root fixtures/demo \
             --data-host http://127.0.0.1:9200 \
             --data-sync 0 \
             --api-port 6101 \
@@ -89,7 +89,7 @@ jobs:
             --skip-openapi \
             --skip-graphql-introspection \
             -- cargo run --quiet --manifest-path rust/Cargo.toml --package kosh-cli -- \
-              --data-root ../fixtures/demo \
+              --data-root fixtures/demo \
               --data-host http://127.0.0.1:9200 \
               --data-sync 0 \
               --api-port 6101 \
