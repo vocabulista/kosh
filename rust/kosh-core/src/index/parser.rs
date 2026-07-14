@@ -262,7 +262,7 @@ impl XmlEntryParser {
             documents.push(document);
 
             let processed = documents.len();
-            if processed % 500 == 0 {
+            if processed.is_multiple_of(500) {
                 info!(
                     lexicon = %self.lexicon.uid,
                     file = %path.display(),
@@ -395,7 +395,7 @@ impl XmlEntryParser {
                                 })?;
                             entry_blobs.push(new_writer.into_inner());
                             processed += 1;
-                            if processed % 500 == 0 {
+                            if processed.is_multiple_of(500) {
                                 info!(
                                     lexicon = %self.lexicon.uid,
                                     file = %path.display(),
@@ -433,7 +433,7 @@ impl XmlEntryParser {
                             })?;
                         entry_blobs.push(new_writer.into_inner());
                         processed += 1;
-                        if processed % 500 == 0 {
+                        if processed.is_multiple_of(500) {
                             info!(
                                 lexicon = %self.lexicon.uid,
                                 file = %path.display(),
@@ -540,7 +540,7 @@ impl XmlEntryParser {
                                 collecting = false;
                                 entry_blobs.push(entry_bytes);
                                 processed += 1;
-                                if processed % 500 == 0 {
+                                if processed.is_multiple_of(500) {
                                     info!(
                                         lexicon = %self.lexicon.uid,
                                         file = %path.display(),
@@ -548,8 +548,8 @@ impl XmlEntryParser {
                                         "parsed lexicon records"
                                     );
                                 }
-                            } else if entry_depth > 0 {
-                                entry_depth -= 1;
+                            } else {
+                                entry_depth = entry_depth.saturating_sub(1);
                             }
                         }
                         continue;
@@ -578,7 +578,7 @@ impl XmlEntryParser {
                             collecting = false;
                             entry_blobs.push(entry_bytes);
                             processed += 1;
-                            if processed % 500 == 0 {
+                            if processed.is_multiple_of(500) {
                                 info!(
                                     lexicon = %self.lexicon.uid,
                                     file = %path.display(),
@@ -586,8 +586,8 @@ impl XmlEntryParser {
                                     "parsed lexicon records"
                                 );
                             }
-                        } else if entry_depth > 0 {
-                            entry_depth -= 1;
+                        } else {
+                            entry_depth = entry_depth.saturating_sub(1);
                         }
                     }
                 }
@@ -603,7 +603,7 @@ impl XmlEntryParser {
             });
         }
 
-        if processed > 0 && processed % 500 != 0 {
+        if processed > 0 && !processed.is_multiple_of(500) {
             info!(
                 lexicon = %self.lexicon.uid,
                 file = %path.display(),

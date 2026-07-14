@@ -83,17 +83,12 @@ impl Default for InfoConfig {
 }
 
 /// Supported output encodings for the logger.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {
+    #[default]
     Text,
     Json,
-}
-
-impl Default for LogFormat {
-    fn default() -> Self {
-        Self::Text
-    }
 }
 
 /// Logging related settings.
@@ -397,7 +392,8 @@ impl KoshConfig {
             ("regexp", self.query_types.regexp),
         ]
         .into_iter()
-        .filter_map(|(name, enabled)| enabled.then(|| name.to_string()))
+        .filter(|&(_, enabled)| enabled)
+        .map(|(name, _)| name.to_string())
         .collect()
     }
 }

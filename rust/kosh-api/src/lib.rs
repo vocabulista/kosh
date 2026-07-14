@@ -472,10 +472,7 @@ async fn restful_entries(
         }
     };
 
-    let payload: Vec<JsonValue> = entries
-        .into_iter()
-        .map(|item| JsonValue::Object(item))
-        .collect();
+    let payload: Vec<JsonValue> = entries.into_iter().map(JsonValue::Object).collect();
 
     metrics.observe_http(endpoint, StatusCode::OK);
 
@@ -559,10 +556,7 @@ async fn restful_ids(
         }
     };
 
-    let payload: Vec<JsonValue> = ids
-        .into_iter()
-        .map(|item| JsonValue::Object(item))
-        .collect();
+    let payload: Vec<JsonValue> = ids.into_iter().map(JsonValue::Object).collect();
 
     metrics.observe_http(endpoint, StatusCode::OK);
 
@@ -1397,7 +1391,7 @@ impl LexiconRuntime {
                     build_graphql_schema(self, search_clone.clone(), query_types_clone.clone())?;
                 Ok(Arc::new(schema))
             })
-            .map(|schema| Arc::clone(schema))
+            .map(Arc::clone)
     }
 }
 

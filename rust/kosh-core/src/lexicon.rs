@@ -88,7 +88,7 @@ pub fn parse_spec(
         source,
     })?;
 
-    let map = parse_spec_map(path.as_ref(), &content)?;
+    let map = parse_spec_map(path, &content)?;
 
     let mut descriptors = Vec::new();
     let base_dir = path
@@ -162,11 +162,7 @@ fn parse_spec_map(
     let mut section = "default".to_string();
 
     for (line_idx, raw_line) in input.lines().enumerate() {
-        let line = match raw_line
-            .split(|c| c == ';' || c == '#')
-            .next()
-            .map(|part| part.trim())
-        {
+        let line = match raw_line.split([';', '#']).next().map(|part| part.trim()) {
             Some("") | None => continue,
             Some(value) => value,
         };
@@ -179,7 +175,7 @@ fn parse_spec_map(
                 });
             };
             section = rest[..end_rel].trim().to_lowercase();
-            map.entry(section.clone()).or_insert_with(HashMap::new);
+            map.entry(section.clone()).or_default();
             continue;
         }
 
@@ -194,13 +190,11 @@ fn parse_spec_map(
             }
             let value = line[pos + 1..].trim().to_owned();
             map.entry(section.clone())
-                .or_insert_with(HashMap::new)
+                .or_default()
                 .insert(key, Some(value));
         } else {
             let key = line.to_lowercase();
-            map.entry(section.clone())
-                .or_insert_with(HashMap::new)
-                .insert(key, None);
+            map.entry(section.clone()).or_default().insert(key, None);
         }
     }
 

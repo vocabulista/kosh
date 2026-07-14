@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use kosh_core::lexicon::LexiconDescriptor;
@@ -34,7 +34,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_schema(path: &PathBuf) -> anyhow::Result<()> {
+fn write_schema(path: &Path) -> anyhow::Result<()> {
     let schema = json!({
         "mappings": {
             "_meta": {
@@ -54,7 +54,7 @@ fn write_schema(path: &PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_xml(path: &PathBuf, entries: usize) -> anyhow::Result<()> {
+fn write_xml(path: &Path, entries: usize) -> anyhow::Result<()> {
     let mut file = File::create(path)?;
     writeln!(file, "<entries>")?;
     for idx in 0..entries {
@@ -67,18 +67,18 @@ fn write_xml(path: &PathBuf, entries: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn make_lexicon(xml_path: &PathBuf, schema_path: &PathBuf) -> anyhow::Result<LexiconDescriptor> {
+fn make_lexicon(xml_path: &Path, schema_path: &Path) -> anyhow::Result<LexiconDescriptor> {
     let schema_raw = fs::read_to_string(schema_path)?;
     let schema = serde_json::from_str(&schema_raw)?;
 
     Ok(LexiconDescriptor {
         uid: "bench".into(),
         pool: "bench[bench]".into(),
-        files: vec![xml_path.clone()],
+        files: vec![xml_path.to_path_buf()],
         schema,
         attributes: HashMap::new(),
         spec_path: PathBuf::from("bench"),
-        schema_path: schema_path.clone(),
+        schema_path: schema_path.to_path_buf(),
     })
 }
 

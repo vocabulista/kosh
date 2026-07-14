@@ -22,7 +22,6 @@ use notify::{
     event::{EventKind, ModifyKind, RenameMode},
     Event, RecommendedWatcher, RecursiveMode, Watcher,
 };
-use num_cpus;
 use thiserror::Error;
 use tokio::{
     signal,
@@ -235,7 +234,7 @@ fn compute_core_quota(quota: u64, period: u64) -> Option<usize> {
         return None;
     }
     let mut cores = quota / period;
-    if quota % period != 0 {
+    if !quota.is_multiple_of(period) {
         cores += 1;
     }
     Some(cores.max(1) as usize)
@@ -500,10 +499,7 @@ impl FailureBudget {
     }
 
     fn should_attempt(&mut self, uid: &str) -> bool {
-        let entry = self
-            .entries
-            .entry(uid.to_string())
-            .or_insert_with(FailureEntry::default);
+        let entry = self.entries.entry(uid.to_string()).or_default();
 
         if let Some(until) = entry.quarantined_until {
             if Instant::now() < until {
@@ -522,10 +518,7 @@ impl FailureBudget {
     }
 
     fn record_failure(&mut self, uid: &str) -> Option<QuarantineState> {
-        let entry = self
-            .entries
-            .entry(uid.to_string())
-            .or_insert_with(FailureEntry::default);
+        let entry = self.entries.entry(uid.to_string()).or_default();
 
         entry.failures = entry.failures.saturating_add(1);
         if entry.failures >= self.max_failures {
@@ -750,13 +743,13 @@ impl LexiconRegistry {
     fn insert_path_mapping(&mut self, path: &Path, uid: &str) {
         self.path_index
             .entry(path.to_path_buf())
-            .or_insert_with(BTreeSet::new)
+            .or_default()
             .insert(uid.to_string());
 
         if let Ok(canonical) = fs::canonicalize(path) {
             self.path_index
                 .entry(canonical)
-                .or_insert_with(BTreeSet::new)
+                .or_default()
                 .insert(uid.to_string());
         }
     }
@@ -1161,6 +1154,7 @@ fn path_changes_from_event(event: Event) -> Vec<PathChange> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_incremental_updates(
     state: Arc<AppState>,
     namespaces: Arc<HashMap<String, String>>,
@@ -1304,7 +1298,7 @@ async fn rebuild_lexicon(
             debug!(phase, lexicon = %lexicon.uid, "no documents produced during rebuild");
         }
 
-        if processed > 0 && processed % 500 != 0 {
+        if processed > 0 && !processed.is_multiple_of(500) {
             info!(phase, lexicon = %lexicon.uid, processed, "rebuild progress");
         }
 
@@ -1347,6 +1341,7 @@ async fn rebuild_lexicon(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_rebuild(
     lexicon: Arc<LexiconDescriptor>,
     namespaces: Arc<HashMap<String, String>>,
@@ -1467,6 +1462,7 @@ async fn execute_rebuild(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn rescan_lexica(
     config: Arc<KoshConfig>,
     state: Arc<AppState>,
@@ -1523,6 +1519,7 @@ async fn rescan_lexica(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn watch_lexica(
     config: Arc<KoshConfig>,
     state: Arc<AppState>,
@@ -1639,10 +1636,13 @@ mod tests {
     use notify::{Event, EventKind};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
-    use std::{env, fs, sync::Arc};
+    use std::{env, fs, sync::Arc, sync::Mutex};
     use tempfile::tempdir;
     use tokio::sync::RwLock;
     use tokio::time::Duration;
+
+    /// Serializes tests that mutate process-global state (env vars, cwd).
+    static GLOBAL_STATE_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvGuard {
         key: &'static str,
@@ -1720,6 +1720,7 @@ mod tests {
 
     #[test]
     fn resolve_config_uses_env_fallback() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("env.ini");
         fs::write(&path, "[info]\nname = env\n").expect("write config");
@@ -1732,6 +1733,7 @@ mod tests {
 
     #[test]
     fn resolve_config_searches_default_locations() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("kosh.ini");
         fs::write(&path, "[info]\nname = default\n").expect("write config");
@@ -1745,6 +1747,7 @@ mod tests {
 
     #[test]
     fn environment_overrides_update_config() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _log_level = EnvGuard::set("KOSH_LOG_LEVEL", "DEBUG");
         let _log_file = EnvGuard::set("KOSH_LOG_FILE", "/tmp/kosh.log");
         let _log_format = EnvGuard::set("KOSH_LOG_FORMAT", "json");
