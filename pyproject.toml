@@ -43,5 +43,8 @@ kosh = "kosh.kosh:main"
 homepage = "https://kosh.uni-koeln.de"
 repository = "https://github.com/cceh/kosh"
 
+[tool.setuptools.packages.find]
+include = ["kosh*"]
+
 [tool.black]
 line-length = 80
